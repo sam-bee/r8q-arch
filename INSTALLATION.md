@@ -22,6 +22,11 @@ Drop the two device-tree files from [`dts/`](dts/) into
 KSRC=... OUT=... ./scripts/build_kernel.sh
 ```
 
+For the first kernel test, use `R8Q_BOOT_MODE=debug` with that command. It
+embeds `r8q.debug=1` in the forced command line, skips mounting `userdata`,
+and starts the initramfs USB NCM/telnet diagnostic path. Rebuild with the
+default `R8Q_BOOT_MODE=arch` when the Arch root filesystem is ready.
+
 The kernel is built with:
 - an **embedded switch-root initramfs** from [`initramfs/`](initramfs/)
   (`CONFIG_INITRAMFS_SOURCE` = the dir with `init` + `irfs.devnodes`; you also
@@ -35,22 +40,34 @@ Outputs: `$OUT/arch/arm64/boot/Image` and
 
 ## 2. Embed the DTB and build UEFI
 
-The DTB lives **inside the firmware** (Mu-Silicium exposes it to the kernel via
-`DtPlatformDxe`). Enable the "Device Tree" FREEFORM block in
-`$MUSIL/Platforms/Samsung/r8qPkg/r8q.fdf`, then:
+The mainline DTB lives **inside the firmware** (Mu-Silicium exposes it to the
+kernel via `DtPlatformDxe`). The build wrapper enables the "Device Tree"
+FREEFORM block in `$MUSIL/Platforms/Samsung/r8qPkg/r8q.fdf` and copies this DTB.
+Keep Mu's separate `Resources/DTBs/r8q.dtb`: that downstream Android device
+tree bootstraps UEFI and must not be replaced with the mainline DTB.
 
 ```bash
 MUSIL=$MUSIL DTB=$OUT/arch/arm64/boot/dts/qcom/sm8250-samsung-r8q.dtb ./scripts/build-uefi.sh
-# -> $MUSIL/Mu-r8q-0.img
+# -> $MUSIL/Mu-r8q.img (current single-model r8q target)
 ```
 
 ## 3. Flash UEFI to BOOT
 
 Put the phone in **download mode** (power off; VolUp+VolDown; plug USB):
 
-```bash
-./scripts/flash.sh $MUSIL/Mu-r8q-0.img       # heimdall flash --BOOT ...; it reboots
-```
+Review the actual image, live PIT and complete selected partition mapping
+before flashing. The legacy `scripts/flash.sh` uses implicit tool/partition
+names; use an explicitly selected Heimdall binary, numeric PIT IDs and a live
+PIT guard. On the reviewed SM-G7810 TGY layout, BOOT is ID23 on LU0 and
+VBMETA is ID66 on LU3. VBMETA_SAMSUNG is a separate ID27 on LU0.
+
+Flash the reviewed Mu Android boot container to BOOT, with the reviewed
+verification-disabled image to VBMETA when required. The kernel `Image` goes
+on CACHE's FAT filesystem in the next steps. Keep stock RECOVERY and SUPER,
+and do not upload a PIT or repartition for this route. A successful
+`--no-reboot` PIT read leaves a session requiring `--resume`; a freshly
+entered Download Mode needs a new handshake. Generate the command from the
+reviewed mapping and current session state rather than copying a previous run.
 
 The phone now boots Mu-Silicium UEFI on every power-on.
 
@@ -381,6 +398,8 @@ Two more things that bite on a fresh ALARM rootfs:
   `/etc`). `systemd-tmpfiles` then fails during package installs with
   `Detected unsafe path transition / (owned by alarm) → /dev`. Fix once with
   `chown root:root / /usr && chmod 755 /`.
-- **`systemctl reboot` does not come back.** Mu-Silicium lives on the `RECOVERY`
-  partition, so returning to Linux always needs the physical
-  **VolUp+Power with USB connected** combo.
+- **Reboot behavior needs to be tested on your device.** This installation
+  route places Mu-Silicium in `BOOT` and retains stock `RECOVERY`. On this
+  route ordinary power-on selects UEFI; VolUp+Power with USB connected selects
+  stock recovery. Do not assume a RECOVERY-based installation when debugging
+  the reboot path.

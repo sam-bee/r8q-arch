@@ -10,6 +10,8 @@ BB=/bin/busybox
 $BB --install -s /bin 2>/dev/null
 export PATH=/bin HOME=/ TERM=linux
 
+mkdir -p /dev /proc /sys /mnt/esp
+
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || mdev -s
@@ -33,15 +35,16 @@ findpart() {
 
 # Append stdin to a file on OUR ESP (the FAT partition carrying BOOTAA64.EFI).
 esp_log() {
-    for part in /dev/sd?*; do
-        [ -b "$part" ] || continue
-        mount -t vfat -o sync "$part" /mnt/esp 2>/dev/null || continue
-        if [ ! -f /mnt/esp/EFI/BOOT/BOOTAA64.EFI ]; then umount /mnt/esp 2>/dev/null; continue; fi
-        mkdir -p /mnt/esp/logs
-        cat >> "/mnt/esp/logs/$1"
-        sync; umount /mnt/esp 2>/dev/null; return 0
-    done
-    return 1
+    part=$(findpart cache) || return 1
+    [ -b "$part" ] || return 1
+    mount -t vfat -o sync "$part" /mnt/esp 2>/dev/null || return 1
+    if [ ! -f /mnt/esp/EFI/BOOT/BOOTAA64.EFI ]; then
+        umount /mnt/esp 2>/dev/null
+        return 1
+    fi
+    mkdir -p /mnt/esp/logs
+    cat >> "/mnt/esp/logs/$1"
+    sync; umount /mnt/esp 2>/dev/null
 }
 
 # NCM gadget + telnet shell — only used on the FAILURE path (Arch's own service
@@ -68,14 +71,18 @@ setup_gadget() {
 
 # ---- wait for userdata (UFS is fast, but be patient), then switch_root --------
 ROOT=""
-i=0
-while [ $i -lt 20 ]; do
-    ROOT=$(findpart userdata); [ -n "$ROOT" ] && break
-    sleep 1; i=$((i+1))
-done
-
 REASON=""
-[ -n "$ROOT" ] || REASON="userdata partition never appeared"
+case " $(cat /proc/cmdline) " in
+    *" r8q.debug=1 "*) REASON="kernel diagnostic mode (userdata mount skipped)" ;;
+    *)
+        i=0
+        while [ $i -lt 20 ]; do
+            ROOT=$(findpart userdata); [ -n "$ROOT" ] && break
+            sleep 1; i=$((i+1))
+        done
+        [ -n "$ROOT" ] || REASON="userdata partition never appeared"
+        ;;
+esac
 mkdir -p /newroot
 if [ -z "$REASON" ]; then
     MOUT=$(mount -t ext4 "$ROOT" /newroot 2>&1) || REASON="ext4 mount of $ROOT failed: $MOUT"
