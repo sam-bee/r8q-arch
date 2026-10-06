@@ -73,20 +73,73 @@ The phone now boots Mu-Silicium UEFI on every power-on.
 
 ## 4. Prepare the ESP (once)
 
-Boot the phone into Mu-Silicium **mass-storage** mode. The ESP is the phone's
-`cache` partition — reformat it vfat once (UFS logical block is 4096):
+Boot the phone into Mu-Silicium **mass-storage** mode by pressing Volume Up
+during the three-second boot-manager timeout and selecting **Mass Storage**.
+This menu path is supported by the pinned Mu source, but the actual option
+presentation and exported handles still need to be confirmed on the SM-G7810.
+Mu mass storage has no source-visible CACHE-only or read-only guarantee; its
+opaque USB driver may expose whole UFS-LU0 candidates. Treat the exported disk
+as write-capable.
+
+Before starting Mu or selecting Mass Storage, temporarily prevent GNOME from
+automounting exported partitions. Save both settings and restore them after
+unmounting the phone's filesystems:
 
 ```bash
-ESP=$(lsblk -o NAME,PARTLABEL -rn | awk '$2=="cache"{print "/dev/"$1}')
+S20_AUTOMOUNT_OLD=$(gsettings get org.gnome.desktop.media-handling automount)
+S20_AUTOMOUNT_OPEN_OLD=$(gsettings get org.gnome.desktop.media-handling automount-open)
+gsettings set org.gnome.desktop.media-handling automount false
+gsettings set org.gnome.desktop.media-handling automount-open false
+```
+
+After Mass Storage appears, identify the USB physical parent and UFS disk, then
+review the exact partition label, start offset, logical sector size, and
+capacity against a fresh PIT. Do not select a partition by scanning every
+desktop block device for `PARTLABEL=cache`. For the reviewed SM-G7810 TGY
+layout only, CACHE is ID32/LU0 with start offset `12013535232` bytes and
+capacity `629145600` bytes; do not generalize those values to another model or
+PIT. Set `ESP` only after that review:
+
+```bash
+lsblk -o NAME,PATH,TYPE,TRAN,PKNAME,SIZE,PARTLABEL,START,LOG-SEC,PHY-SEC,FSTYPE,MOUNTPOINTS
+ESP='/dev/REPLACE_WITH_VERIFIED_CACHE_PARTITION'
+test -b "$ESP"
+udevadm info --query=path --name="$ESP"   # must belong to the phone's USB parent
+cat "/sys/class/block/${ESP##*/}/start"  # kernel sectors of 512 bytes; multiply by 512
+sudo blockdev --getss "$ESP"       # must match the reviewed logical 4096-byte sector
+sudo blockdev --getsize64 "$ESP"   # must match the reviewed CACHE capacity
+```
+
+Stop if the placeholder remains or any check disagrees with the reviewed PIT.
+For the layout above, the kernel start value is `23463936` in 512-byte units;
+that is separate from the device's 4096-byte logical sector size.
+
+During SM-G7810 TGY bring-up, the raw FAT CACHE transfer through Samsung Download
+Mode failed. The sparse stock CACHE restore succeeded. Stage the FAT ESP through
+Mu mass storage after verifying its runtime mapping. Reformat only the verified
+CACHE partition (UFS logical block is 4096):
+
+```bash
 sudo mkfs.vfat -F 32 -S 4096 -n R8QESP "$ESP"
 ```
 
 ## 5. Deploy the kernel Image to the ESP
 
-Still in mass-storage mode:
+Still in mass-storage mode, use the already verified `ESP` explicitly. The
+legacy `scripts/deploy-esp.sh` performs an unguarded global PARTLABEL scan, so
+do not run it for this flow:
 
 ```bash
-./scripts/deploy-esp.sh $OUT/arch/arm64/boot/Image   # -> ESP:/EFI/BOOT/BOOTAA64.EFI
+S20_ESP_MNT=$(mktemp -d)
+sudo mount "$ESP" "$S20_ESP_MNT"
+sudo mkdir -p "$S20_ESP_MNT/EFI/BOOT"
+sudo cp "$OUT/arch/arm64/boot/Image" "$S20_ESP_MNT/EFI/BOOT/BOOTAA64.EFI"
+sync
+sudo cmp "$OUT/arch/arm64/boot/Image" "$S20_ESP_MNT/EFI/BOOT/BOOTAA64.EFI"
+sudo umount "$S20_ESP_MNT"
+rmdir "$S20_ESP_MNT"
+gsettings set org.gnome.desktop.media-handling automount "$S20_AUTOMOUNT_OLD"
+gsettings set org.gnome.desktop.media-handling automount-open "$S20_AUTOMOUNT_OPEN_OLD"
 ```
 
 ## 6. Install Arch onto userdata
