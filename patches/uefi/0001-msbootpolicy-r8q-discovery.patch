@@ -1,0 +1,1332 @@
+diff --git a/PcBdsPkg/MsBootPolicy/MsBootPolicy.c b/PcBdsPkg/MsBootPolicy/MsBootPolicy.c
+index 25ac988..88faf8a 100644
+--- a/PcBdsPkg/MsBootPolicy/MsBootPolicy.c
++++ b/PcBdsPkg/MsBootPolicy/MsBootPolicy.c
+@@ -9,6 +9,1124 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
+ 
+ #define USB_DRIVE_SECOND_CHANCE_DELAY_S  6
+ 
++#define R8Q_DISCOVERY_CACHE_START_LBA  ((EFI_LBA)2932992)
++#define R8Q_DISCOVERY_CACHE_END_LBA    ((EFI_LBA)3086591)
++#define R8Q_DISCOVERY_CACHE_BLOCKS      ((EFI_LBA)153600)
++#define R8Q_DISCOVERY_PAGE_COLUMNS     60
++#define R8Q_DISCOVERY_MIN_ROWS         20
++#define R8Q_DISCOVERY_MAX_WHOLE        8
++#define R8Q_DISCOVERY_MAX_CACHE_SFS    1
++#define R8Q_DISCOVERY_MAX_FILE_INFO    1024
++#define R8Q_DISCOVERY_QUIET_100NS      ((UINT64)300 * 10000)
++#define R8Q_DISCOVERY_DRAIN_MAX_100NS  ((UINT64)4 * 1000 * 10000)
++
++STATIC EFI_GUID  mR8qCachePartitionGuid = {
++  0x5594c694, 0xc871, 0x4b5f, { 0x90, 0xb1, 0x69, 0x0a, 0x6f, 0x68, 0xe0, 0xf7 }
++};
++
++typedef struct {
++  UINT32   BlockSize;
++  EFI_LBA  LastBlock;
++  BOOLEAN  RemovableMedia;
++  BOOLEAN  MediaPresent;
++  BOOLEAN  ReadOnly;
++  BOOLEAN  HasUfsPath;
++  UINT8    UfsPun;
++  UINT8    UfsLun;
++} R8Q_WHOLE_BLOCK;
++
++typedef struct {
++  BOOLEAN  FromPartitionInfo;
++  BOOLEAN  FromHardDrivePath;
++  EFI_LBA  StartLba;
++  EFI_LBA  EndLba;
++  UINT32   BlockSize;
++  EFI_LBA  LastBlock;
++  UINT64   Attributes;
++  CHAR16   Label[13];
++} R8Q_CACHE_MATCH;
++
++typedef struct {
++  EFI_STATUS  VolumeStatus;
++  EFI_STATUS  OpenStatus;
++  EFI_STATUS  InfoStatus;
++  UINT64      FileSize;
++  BOOLEAN     FileSizeValid;
++} R8Q_CACHE_FILE_RESULT;
++
++typedef struct {
++  UINTN  Rows;
++  UINTN  TotalRows;
++} R8Q_PAGE;
++
++typedef struct {
++  UINTN       Candidate;
++  EFI_STATUS  Status;
++  BOOLEAN     IsCache;
++} R8Q_BOOT_ATTEMPT;
++
++BOOLEAN EFIAPI
++IsDevicePathUSB (
++  EFI_DEVICE_PATH_PROTOCOL  *DevicePath
++  );
++
++STATIC BOOLEAN          mR8qDiagnosticActive;
++STATIC EFI_STATUS       mR8qLastBootOptionStatus;
++STATIC BOOLEAN          mR8qBootOptionStatusValid;
++STATIC EFI_STATUS       mR8qFinalSelectionStatus;
++STATIC BOOLEAN          mR8qNoHandlesAfterFilter;
++STATIC R8Q_BOOT_ATTEMPT *mR8qBootAttempts;
++STATIC UINTN            mR8qBootAttemptCount;
++
++
++STATIC
++BOOLEAN
++R8qGetUfsPath (
++  IN  EFI_DEVICE_PATH_PROTOCOL  *DevicePath,
++  OUT UINT8                     *Pun,
++  OUT UINT8                     *Lun
++  )
++{
++  if ((DevicePath == NULL) || !IsDevicePathValid (DevicePath, 0) ||
++      (Pun == NULL) || (Lun == NULL))
++  {
++    return FALSE;
++  }
++
++  for (;;) {
++    if (DevicePath == NULL ||
++        DevicePathNodeLength (DevicePath) < sizeof (EFI_DEVICE_PATH_PROTOCOL))
++    {
++      return FALSE;
++    }
++
++    if (IsDevicePathEndType (DevicePath)) {
++      break;
++    }
++
++    if ((DevicePathType (DevicePath) == MESSAGING_DEVICE_PATH) &&
++        (DevicePathSubType (DevicePath) == MSG_UFS_DP) &&
++        (DevicePathNodeLength (DevicePath) >= sizeof (UFS_DEVICE_PATH)))
++    {
++      *Pun = ((UFS_DEVICE_PATH *)DevicePath)->Pun;
++      *Lun = ((UFS_DEVICE_PATH *)DevicePath)->Lun;
++      return TRUE;
++    }
++
++    DevicePath = NextDevicePathNode (DevicePath);
++  }
++
++  return FALSE;
++}
++
++STATIC
++BOOLEAN
++R8qGetCacheHardDrivePath (
++  IN EFI_DEVICE_PATH_PROTOCOL  *DevicePath
++  )
++{
++  HARDDRIVE_DEVICE_PATH  *HardDrive;
++
++  if ((DevicePath == NULL) || !IsDevicePathValid (DevicePath, 0)) {
++    return FALSE;
++  }
++
++  for (;;) {
++    if (DevicePath == NULL ||
++        DevicePathNodeLength (DevicePath) < sizeof (EFI_DEVICE_PATH_PROTOCOL))
++    {
++      return FALSE;
++    }
++
++    if (IsDevicePathEndType (DevicePath)) {
++      break;
++    }
++
++    if ((DevicePathType (DevicePath) == MEDIA_DEVICE_PATH) &&
++        (DevicePathSubType (DevicePath) == MEDIA_HARDDRIVE_DP) &&
++        (DevicePathNodeLength (DevicePath) >= sizeof (HARDDRIVE_DEVICE_PATH)))
++    {
++      HardDrive = (HARDDRIVE_DEVICE_PATH *)DevicePath;
++      if ((HardDrive->MBRType == MBR_TYPE_EFI_PARTITION_TABLE_HEADER) &&
++          (HardDrive->SignatureType == SIGNATURE_TYPE_GUID) &&
++          (CompareMem (HardDrive->Signature, &mR8qCachePartitionGuid, sizeof (EFI_GUID)) == 0) &&
++          (HardDrive->PartitionStart == R8Q_DISCOVERY_CACHE_START_LBA) &&
++          (HardDrive->PartitionSize == R8Q_DISCOVERY_CACHE_BLOCKS))
++      {
++        return TRUE;
++      }
++    }
++
++    DevicePath = NextDevicePathNode (DevicePath);
++  }
++
++  return FALSE;
++}
++
++STATIC
++VOID
++R8qCopyPartitionLabel (
++  OUT CHAR16                       *Destination,
++  IN  EFI_PARTITION_INFO_PROTOCOL  *PartitionInfo
++  )
++{
++  if ((Destination == NULL) || (PartitionInfo == NULL)) {
++    return;
++  }
++
++  CopyMem (Destination, PartitionInfo->Info.Gpt.PartitionName, 12 * sizeof (CHAR16));
++  Destination[12] = L'\0';
++}
++
++STATIC
++BOOLEAN
++R8qIsCacheHandle (
++  IN  EFI_HANDLE       Handle,
++  OUT R8Q_CACHE_MATCH  *Match
++  )
++{
++  EFI_STATUS                    Status;
++  EFI_STATUS                    BlockStatus;
++  EFI_PARTITION_INFO_PROTOCOL   *PartitionInfo;
++  EFI_BLOCK_IO_PROTOCOL         *BlockIo;
++  UINT8                          Pun;
++  UINT8                          Lun;
++
++  if (Match == NULL) {
++    return FALSE;
++  }
++
++  ZeroMem (Match, sizeof (*Match));
++  if (R8qGetUfsPath (DevicePathFromHandle (Handle), &Pun, &Lun) && (Lun != 0)) {
++    return FALSE;
++  }
++
++  PartitionInfo = NULL;
++  BlockIo       = NULL;
++  Status = gBS->HandleProtocol (
++                  Handle,
++                  &gEfiPartitionInfoProtocolGuid,
++                  (VOID **)&PartitionInfo
++                  );
++  BlockStatus = gBS->HandleProtocol (
++                  Handle,
++                  &gEfiBlockIoProtocolGuid,
++                  (VOID **)&BlockIo
++                  );
++  if (!EFI_ERROR (BlockStatus) && (BlockIo != NULL) && (BlockIo->Media != NULL)) {
++    Match->BlockSize = BlockIo->Media->BlockSize;
++    Match->LastBlock = BlockIo->Media->LastBlock;
++  }
++
++  if (!EFI_ERROR (Status) && (PartitionInfo != NULL) &&
++      (PartitionInfo->Type == PARTITION_TYPE_GPT) &&
++      CompareGuid (&PartitionInfo->Info.Gpt.PartitionTypeGUID, &mR8qCachePartitionGuid) &&
++      CompareGuid (&PartitionInfo->Info.Gpt.UniquePartitionGUID, &mR8qCachePartitionGuid) &&
++      (PartitionInfo->Info.Gpt.StartingLBA == R8Q_DISCOVERY_CACHE_START_LBA) &&
++      (PartitionInfo->Info.Gpt.EndingLBA == R8Q_DISCOVERY_CACHE_END_LBA))
++  {
++    Match->FromPartitionInfo = TRUE;
++    Match->StartLba          = PartitionInfo->Info.Gpt.StartingLBA;
++    Match->EndLba            = PartitionInfo->Info.Gpt.EndingLBA;
++    Match->Attributes        = PartitionInfo->Info.Gpt.Attributes;
++    R8qCopyPartitionLabel (Match->Label, PartitionInfo);
++    return TRUE;
++  }
++
++  if (R8qGetCacheHardDrivePath (DevicePathFromHandle (Handle))) {
++    Match->FromHardDrivePath = TRUE;
++    Match->StartLba          = R8Q_DISCOVERY_CACHE_START_LBA;
++    Match->EndLba            = R8Q_DISCOVERY_CACHE_END_LBA;
++    CopyMem (Match->Label, L"hd-path", sizeof (L"hd-path"));
++    return TRUE;
++  }
++
++  return FALSE;
++}
++
++STATIC
++EFI_STATUS
++R8qDrainDiagnosticInput (
++  VOID
++  )
++{
++  EFI_STATUS      Status;
++  EFI_EVENT       QuietEvent;
++  EFI_EVENT       MaxEvent;
++  EFI_EVENT       Events[3];
++  UINTN           EventIndex;
++  EFI_INPUT_KEY   Key;
++
++  if ((gST == NULL) || (gST->ConIn == NULL)) {
++    return EFI_NOT_READY;
++  }
++
++  QuietEvent = NULL;
++  MaxEvent   = NULL;
++  Status     = gBS->CreateEvent (EVT_TIMER, TPL_NOTIFY, NULL, NULL, &QuietEvent);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Status = gBS->CreateEvent (EVT_TIMER, TPL_NOTIFY, NULL, NULL, &MaxEvent);
++  if (EFI_ERROR (Status)) {
++    gBS->CloseEvent (QuietEvent);
++    return Status;
++  }
++
++  Events[0] = gST->ConIn->WaitForKey;
++  Events[1] = QuietEvent;
++  Events[2] = MaxEvent;
++  Status = gBS->SetTimer (QuietEvent, TimerRelative, R8Q_DISCOVERY_QUIET_100NS);
++  if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  Status = gBS->SetTimer (MaxEvent, TimerRelative, R8Q_DISCOVERY_DRAIN_MAX_100NS);
++  if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  for (;;) {
++    Status = gBS->CheckEvent (MaxEvent);
++    if (Status == EFI_SUCCESS) {
++      Status = EFI_TIMEOUT;
++      goto Done;
++    }
++
++    if (Status != EFI_NOT_READY) {
++      goto Done;
++    }
++
++    Status = gBS->WaitForEvent (ARRAY_SIZE (Events), Events, &EventIndex);
++    if (EFI_ERROR (Status)) {
++      goto Done;
++    }
++
++    if (EventIndex == 1) {
++      Status = EFI_SUCCESS;
++      goto Done;
++    }
++
++    if (EventIndex == 2) {
++      Status = EFI_TIMEOUT;
++      goto Done;
++    }
++
++    Status = gST->ConIn->ReadKeyStroke (gST->ConIn, &Key);
++    if (Status == EFI_NOT_READY) {
++      continue;
++    }
++
++    if (EFI_ERROR (Status)) {
++      goto Done;
++    }
++
++    if (Key.ScanCode == SCAN_UP) {
++      Status = EFI_ABORTED;
++      goto Done;
++    }
++
++    Status = gBS->SetTimer (QuietEvent, TimerRelative, R8Q_DISCOVERY_QUIET_100NS);
++    if (EFI_ERROR (Status)) {
++      goto Done;
++    }
++  }
++
++Done:
++  gBS->CloseEvent (QuietEvent);
++  gBS->CloseEvent (MaxEvent);
++  return Status;
++}
++
++STATIC
++EFI_STATUS
++R8qWaitForDiagnosticAction (
++  OUT BOOLEAN  *AbortToMenu
++  )
++{
++  EFI_STATUS      Status;
++  EFI_INPUT_KEY   Key;
++  UINTN           EventIndex;
++
++  if ((AbortToMenu == NULL) || (gST == NULL) || (gST->ConIn == NULL)) {
++    return EFI_INVALID_PARAMETER;
++  }
++
++  *AbortToMenu = FALSE;
++  for (;;) {
++    Status = gBS->WaitForEvent (1, &gST->ConIn->WaitForKey, &EventIndex);
++    if (EFI_ERROR (Status)) {
++      return Status;
++    }
++
++    Status = gST->ConIn->ReadKeyStroke (gST->ConIn, &Key);
++    if (Status == EFI_NOT_READY) {
++      continue;
++    }
++
++    if (EFI_ERROR (Status)) {
++      return Status;
++    }
++
++    if (Key.ScanCode == SCAN_UP) {
++      *AbortToMenu = TRUE;
++      return EFI_ABORTED;
++    }
++
++    if (Key.UnicodeChar == CHAR_CARRIAGE_RETURN) {
++      return R8qDrainDiagnosticInput ();
++    }
++  }
++}
++
++STATIC
++EFI_STATUS
++R8qOpenDiagnosticPage (
++  IN  CONST CHAR16  *Title,
++  OUT R8Q_PAGE      *Page
++  )
++{
++  EFI_STATUS  Status;
++  UINTN       Columns;
++  UINTN       Rows;
++
++  if ((Title == NULL) || (Page == NULL) || (gST == NULL) ||
++      (gST->ConOut == NULL) || (gST->ConOut->Mode == NULL))
++  {
++    return EFI_NOT_READY;
++  }
++
++  Status = gST->ConOut->QueryMode (
++                                  gST->ConOut,
++                                  gST->ConOut->Mode->Mode,
++                                  &Columns,
++                                  &Rows
++                                  );
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  if ((Columns <= R8Q_DISCOVERY_PAGE_COLUMNS) || (Rows < R8Q_DISCOVERY_MIN_ROWS)) {
++    return EFI_UNSUPPORTED;
++  }
++
++  Status = gST->ConOut->ClearScreen (gST->ConOut);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Page->Rows      = 0;
++  Page->TotalRows = Rows;
++  Status = gST->ConOut->OutputString (gST->ConOut, L"R8Q discovery\r\n");
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Page->Rows++;
++  Status = gST->ConOut->OutputString (gST->ConOut, (CHAR16 *)Title);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Status = gST->ConOut->OutputString (gST->ConOut, L"\r\n");
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Page->Rows++;
++  Status = gST->ConOut->OutputString (gST->ConOut, L"CR next  Up menu\r\n");
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Page->Rows++;
++  return EFI_SUCCESS;
++}
++
++STATIC
++EFI_STATUS
++R8qPrintDiagnosticText (
++  IN OUT R8Q_PAGE      *Page,
++  IN     CONST CHAR16  *Text
++  )
++{
++  EFI_STATUS  Status;
++
++  if ((Page == NULL) || (Text == NULL) || (gST == NULL) ||
++      (gST->ConOut == NULL) || (gST->ConOut->Mode == NULL))
++  {
++    return EFI_NOT_READY;
++  }
++
++  if ((Page->Rows + 1) >= Page->TotalRows) {
++    return EFI_BUFFER_TOO_SMALL;
++  }
++
++  if (StrLen (Text) > R8Q_DISCOVERY_PAGE_COLUMNS) {
++    return EFI_BAD_BUFFER_SIZE;
++  }
++
++  Status = gST->ConOut->OutputString (gST->ConOut, (CHAR16 *)Text);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Status = gST->ConOut->OutputString (gST->ConOut, L"\r\n");
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Page->Rows++;
++  return EFI_SUCCESS;
++}
++
++STATIC
++EFI_STATUS
++R8qPrintDiagnosticLine (
++  IN OUT R8Q_PAGE      *Page,
++  IN OUT UINTN         *Omitted,
++  IN     CONST CHAR16  *Format,
++  ...
++  )
++{
++  VA_LIST     Marker;
++  CHAR16      Buffer[128];
++  EFI_STATUS  Status;
++
++  if ((Page == NULL) || (Omitted == NULL) || (Format == NULL)) {
++    return EFI_INVALID_PARAMETER;
++  }
++
++  VA_START (Marker, Format);
++  UnicodeVSPrint (Buffer, sizeof (Buffer), Format, Marker);
++  VA_END (Marker);
++
++  Status = R8qPrintDiagnosticText (Page, Buffer);
++  if (Status == EFI_BUFFER_TOO_SMALL) {
++    (*Omitted)++;
++    return EFI_SUCCESS;
++  }
++
++  return Status;
++}
++
++STATIC
++EFI_STATUS
++R8qInspectCacheVolume (
++  IN  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL  *FileSystem,
++  OUT R8Q_CACHE_FILE_RESULT            *Result
++  )
++{
++  EFI_STATUS         Status;
++  EFI_FILE_PROTOCOL  *Root;
++  EFI_FILE_PROTOCOL  *File;
++  EFI_FILE_INFO      *FileInfo;
++  UINTN              InfoSize;
++
++  if ((FileSystem == NULL) || (Result == NULL)) {
++    return EFI_INVALID_PARAMETER;
++  }
++
++  ZeroMem (Result, sizeof (*Result));
++  Result->VolumeStatus = EFI_NOT_READY;
++  Result->OpenStatus   = EFI_NOT_READY;
++  Result->InfoStatus   = EFI_NOT_READY;
++  Root                = NULL;
++  File                = NULL;
++  FileInfo            = NULL;
++  InfoSize            = 0;
++
++  Status = FileSystem->OpenVolume (FileSystem, &Root);
++  Result->VolumeStatus = Status;
++  if (EFI_ERROR (Status) || (Root == NULL)) {
++    if (!EFI_ERROR (Status)) {
++      Result->VolumeStatus = EFI_DEVICE_ERROR;
++    }
++
++    goto Done;
++  }
++
++  Status = Root->Open (
++                  Root,
++                  &File,
++                  EFI_REMOVABLE_MEDIA_FILE_NAME,
++                  EFI_FILE_MODE_READ,
++                  0
++                  );
++  Result->OpenStatus = Status;
++  if (EFI_ERROR (Status) || (File == NULL)) {
++    if (!EFI_ERROR (Status)) {
++      Result->OpenStatus = EFI_DEVICE_ERROR;
++    }
++
++    goto Done;
++  }
++
++  Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, NULL);
++  if ((Status != EFI_BUFFER_TOO_SMALL) ||
++      (InfoSize < sizeof (EFI_FILE_INFO)) ||
++      (InfoSize > R8Q_DISCOVERY_MAX_FILE_INFO))
++  {
++    Result->InfoStatus = (Status == EFI_BUFFER_TOO_SMALL) ? EFI_BAD_BUFFER_SIZE : Status;
++    goto Done;
++  }
++
++  FileInfo = AllocateZeroPool (InfoSize);
++  if (FileInfo == NULL) {
++    Result->InfoStatus = EFI_OUT_OF_RESOURCES;
++    goto Done;
++  }
++
++  Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, FileInfo);
++  Result->InfoStatus = Status;
++  if (!EFI_ERROR (Status)) {
++    if ((InfoSize < sizeof (EFI_FILE_INFO)) || (FileInfo->Size < sizeof (EFI_FILE_INFO)) ||
++        (FileInfo->Size > InfoSize))
++    {
++      Result->InfoStatus = EFI_BAD_BUFFER_SIZE;
++    } else {
++      Result->FileSize      = FileInfo->FileSize;
++      Result->FileSizeValid = TRUE;
++    }
++  }
++
++Done:
++  if (FileInfo != NULL) {
++    FreePool (FileInfo);
++  }
++
++  if (File != NULL) {
++    File->Close (File);
++  }
++
++  if (Root != NULL) {
++    Root->Close (Root);
++  }
++
++  return EFI_SUCCESS;
++}
++
++STATIC
++EFI_STATUS
++R8qRunDiscovery (
++  VOID
++  )
++{
++  EFI_STATUS                         Status;
++  EFI_STATUS                         FileStatus;
++  EFI_HANDLE                         *BlockHandles;
++  EFI_HANDLE                         *PartitionHandles;
++  EFI_HANDLE                         *SfsHandles;
++  UINTN                              BlockCount;
++  UINTN                              PartitionCount;
++  UINTN                              SfsCount;
++  UINTN                              Index;
++  UINTN                              StoredWholeCount;
++  UINTN                              WholeCount;
++  UINTN                              CachePartitionCount;
++  UINTN                              CacheHardDriveCount;
++  UINTN                              CacheSfsCount;
++  UINTN                              StoredFileCount;
++  UINTN                              Omitted;
++  UINTN                              NonUsbSfsCount;
++  UINTN                              NoPathSfsCount;
++  UINTN                              Printed;
++  BOOLEAN                            AbortToMenu;
++  EFI_BLOCK_IO_PROTOCOL              *BlockIo;
++  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL    *FileSystem;
++  EFI_DEVICE_PATH_PROTOCOL           *DevicePath;
++  R8Q_WHOLE_BLOCK                    WholeBlocks[R8Q_DISCOVERY_MAX_WHOLE];
++  R8Q_CACHE_MATCH                    CacheMatch;
++  R8Q_CACHE_MATCH                    FirstCacheMatch;
++  R8Q_CACHE_FILE_RESULT              CacheFiles[R8Q_DISCOVERY_MAX_CACHE_SFS];
++  R8Q_PAGE                           Page;
++  CHAR16                             Label[13];
++
++  BlockHandles       = NULL;
++  PartitionHandles   = NULL;
++  SfsHandles         = NULL;
++  BlockCount         = 0;
++  PartitionCount     = 0;
++  SfsCount           = 0;
++  StoredWholeCount   = 0;
++  WholeCount         = 0;
++  CachePartitionCount = 0;
++  CacheHardDriveCount = 0;
++  CacheSfsCount      = 0;
++  StoredFileCount    = 0;
++  NonUsbSfsCount     = 0;
++  NoPathSfsCount      = 0;
++  ZeroMem (WholeBlocks, sizeof (WholeBlocks));
++  ZeroMem (&FirstCacheMatch, sizeof (FirstCacheMatch));
++  ZeroMem (CacheFiles, sizeof (CacheFiles));
++
++  if ((gST == NULL) || (gST->ConIn == NULL) || (gST->ConOut == NULL)) {
++    return EFI_NOT_READY;
++  }
++
++  Status = gBS->SetWatchdogTimer (0, 0, 0, NULL);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Status = R8qDrainDiagnosticInput ();
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Status = gBS->LocateHandleBuffer (
++                  ByProtocol,
++                  &gEfiBlockIoProtocolGuid,
++                  NULL,
++                  &BlockCount,
++                  &BlockHandles
++                  );
++  if (Status == EFI_NOT_FOUND) {
++    BlockCount   = 0;
++    BlockHandles = NULL;
++  } else if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  Status = gBS->LocateHandleBuffer (
++                  ByProtocol,
++                  &gEfiPartitionInfoProtocolGuid,
++                  NULL,
++                  &PartitionCount,
++                  &PartitionHandles
++                  );
++  if (Status == EFI_NOT_FOUND) {
++    PartitionCount     = 0;
++    PartitionHandles   = NULL;
++  } else if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  for (Index = 0; Index < BlockCount; Index++) {
++    BlockIo = NULL;
++    Status  = gBS->HandleProtocol (
++                     BlockHandles[Index],
++                     &gEfiBlockIoProtocolGuid,
++                     (VOID **)&BlockIo
++                     );
++    if (EFI_ERROR (Status) || (BlockIo == NULL) || (BlockIo->Media == NULL)) {
++      if (!EFI_ERROR (Status)) {
++        Status = EFI_DEVICE_ERROR;
++      }
++
++      goto Done;
++    }
++
++    if (!BlockIo->Media->LogicalPartition) {
++      WholeCount++;
++      if (StoredWholeCount < R8Q_DISCOVERY_MAX_WHOLE) {
++        WholeBlocks[StoredWholeCount].BlockSize       = BlockIo->Media->BlockSize;
++        WholeBlocks[StoredWholeCount].LastBlock       = BlockIo->Media->LastBlock;
++        WholeBlocks[StoredWholeCount].RemovableMedia  = BlockIo->Media->RemovableMedia;
++        WholeBlocks[StoredWholeCount].MediaPresent    = BlockIo->Media->MediaPresent;
++        WholeBlocks[StoredWholeCount].ReadOnly        = BlockIo->Media->ReadOnly;
++        DevicePath = DevicePathFromHandle (BlockHandles[Index]);
++        WholeBlocks[StoredWholeCount].HasUfsPath = R8qGetUfsPath (
++                                                   DevicePath,
++                                                   &WholeBlocks[StoredWholeCount].UfsPun,
++                                                   &WholeBlocks[StoredWholeCount].UfsLun
++                                                   );
++        StoredWholeCount++;
++      }
++    }
++
++    if (R8qIsCacheHandle (BlockHandles[Index], &CacheMatch)) {
++      if (CacheMatch.FromPartitionInfo) {
++        CachePartitionCount++;
++        if (CachePartitionCount == 1) {
++          CopyMem (&FirstCacheMatch, &CacheMatch, sizeof (FirstCacheMatch));
++        }
++      }
++
++      if (CacheMatch.FromHardDrivePath) {
++        CacheHardDriveCount++;
++      }
++    }
++  }
++
++  Status = gBS->LocateHandleBuffer (
++                  ByProtocol,
++                  &gEfiSimpleFileSystemProtocolGuid,
++                  NULL,
++                  &SfsCount,
++                  &SfsHandles
++                  );
++  if (Status == EFI_NOT_FOUND) {
++    SfsCount   = 0;
++    SfsHandles = NULL;
++  } else if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  for (Index = 0; Index < SfsCount; Index++) {
++    DevicePath = DevicePathFromHandle (SfsHandles[Index]);
++    if (DevicePath == NULL) {
++      NoPathSfsCount++;
++    } else if (!IsDevicePathUSB (DevicePath)) {
++      NonUsbSfsCount++;
++    }
++
++    FileSystem = NULL;
++    Status     = gBS->HandleProtocol (
++                         SfsHandles[Index],
++                         &gEfiSimpleFileSystemProtocolGuid,
++                         (VOID **)&FileSystem
++                         );
++    if (EFI_ERROR (Status) || (FileSystem == NULL)) {
++      if (!EFI_ERROR (Status)) {
++        Status = EFI_DEVICE_ERROR;
++      }
++
++      goto Done;
++    }
++
++    if (R8qIsCacheHandle (SfsHandles[Index], &CacheMatch)) {
++      CacheSfsCount++;
++      if (StoredFileCount < R8Q_DISCOVERY_MAX_CACHE_SFS) {
++        FileStatus = R8qInspectCacheVolume (FileSystem, &CacheFiles[StoredFileCount]);
++        if (EFI_ERROR (FileStatus)) {
++          Status = FileStatus;
++          goto Done;
++        }
++
++        StoredFileCount++;
++      }
++    }
++  }
++
++  Status = R8qOpenDiagnosticPage (L"Internal storage / Block I/O", &Page);
++  if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  Omitted = 0;
++  Status  = R8qPrintDiagnosticLine (&Page, &Omitted, L"BLK %u whole %u", BlockCount, WholeCount);
++  if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  Printed = StoredWholeCount;
++  for (Index = 0; Index < Printed; Index++) {
++    if (WholeBlocks[Index].HasUfsPath) {
++      Status = R8qPrintDiagnosticLine (
++                 &Page,
++                 &Omitted,
++                 L"W%u sz%u last%Lu M%u P%u R%u U%u/%u",
++                 Index,
++                 WholeBlocks[Index].BlockSize,
++                 WholeBlocks[Index].LastBlock,
++                 WholeBlocks[Index].RemovableMedia,
++                 WholeBlocks[Index].MediaPresent,
++                 WholeBlocks[Index].ReadOnly,
++                 WholeBlocks[Index].UfsPun,
++                 WholeBlocks[Index].UfsLun
++                 );
++    } else {
++      Status = R8qPrintDiagnosticLine (
++                 &Page,
++                 &Omitted,
++                 L"W%u sz%u last%Lu M%u P%u R%u U--",
++                 Index,
++                 WholeBlocks[Index].BlockSize,
++                 WholeBlocks[Index].LastBlock,
++                 WholeBlocks[Index].RemovableMedia,
++                 WholeBlocks[Index].MediaPresent,
++                 WholeBlocks[Index].ReadOnly
++                 );
++    }
++
++    if (EFI_ERROR (Status)) {
++      goto Done;
++    }
++  }
++
++  if (WholeCount > Printed) {
++    Status = R8qPrintDiagnosticLine (&Page, &Omitted, L"+%u whole omitted", WholeCount - Printed);
++    if (EFI_ERROR (Status)) {
++      goto Done;
++    }
++  }
++
++  Status = R8qPrintDiagnosticLine (
++             &Page,
++             &Omitted,
++             L"PI %u C%u H%u",
++             PartitionCount,
++             CachePartitionCount,
++             CacheHardDriveCount
++             );
++  if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  if (CachePartitionCount > 0) {
++    CopyMem (Label, FirstCacheMatch.Label, sizeof (Label));
++    Status = R8qPrintDiagnosticLine (
++               &Page,
++               &Omitted,
++               L"C %s %Lu-%Lu a%Lx",
++               Label,
++               FirstCacheMatch.StartLba,
++               FirstCacheMatch.EndLba,
++               FirstCacheMatch.Attributes
++               );
++    if (EFI_ERROR (Status)) {
++      goto Done;
++    }
++
++    Status = R8qPrintDiagnosticLine (
++               &Page,
++               &Omitted,
++               L"C disk sz%u last%Lu",
++               FirstCacheMatch.BlockSize,
++               FirstCacheMatch.LastBlock
++               );
++    if (EFI_ERROR (Status)) {
++      goto Done;
++    }
++  }
++
++  if (Omitted > 0) {
++    Status = R8qPrintDiagnosticLine (&Page, &Omitted, L"+%u lines omitted", Omitted);
++    if (EFI_ERROR (Status)) {
++      goto Done;
++    }
++  }
++
++  Status = R8qWaitForDiagnosticAction (&AbortToMenu);
++  if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  if (AbortToMenu) {
++    Status = EFI_ABORTED;
++    goto Done;
++  }
++
++  Status = R8qOpenDiagnosticPage (L"Simple File System / boot file", &Page);
++  if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  Omitted = 0;
++  Status  = R8qPrintDiagnosticLine (
++              &Page,
++              &Omitted,
++              L"SFS %u nonUSB %u noPath %u",
++              SfsCount,
++              NonUsbSfsCount,
++              NoPathSfsCount
++              );
++  if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  Status = R8qPrintDiagnosticLine (&Page, &Omitted, L"CACHE SFS %u", CacheSfsCount);
++  if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  for (Index = 0; Index < StoredFileCount; Index++) {
++    Status = R8qPrintDiagnosticLine (
++               &Page,
++               &Omitted,
++               L"C%u vol %r open %r",
++               Index,
++               CacheFiles[Index].VolumeStatus,
++               CacheFiles[Index].OpenStatus
++               );
++    if (EFI_ERROR (Status)) {
++      goto Done;
++    }
++
++    if (CacheFiles[Index].FileSizeValid) {
++      Status = R8qPrintDiagnosticLine (
++                 &Page,
++                 &Omitted,
++                 L"C%u info %r size %Lu",
++                 Index,
++                 CacheFiles[Index].InfoStatus,
++                 CacheFiles[Index].FileSize
++                 );
++    } else {
++      Status = R8qPrintDiagnosticLine (
++                 &Page,
++                 &Omitted,
++                 L"C%u info %r size --",
++                 Index,
++                 CacheFiles[Index].InfoStatus
++                 );
++    }
++
++    if (EFI_ERROR (Status)) {
++      goto Done;
++    }
++  }
++
++  if (CacheSfsCount > StoredFileCount) {
++    Status = R8qPrintDiagnosticLine (
++               &Page,
++               &Omitted,
++               L"+%u CACHE SFS uninspected",
++               CacheSfsCount - StoredFileCount
++               );
++    if (EFI_ERROR (Status)) {
++      goto Done;
++    }
++  }
++
++  Status = R8qPrintDiagnosticLine (&Page, &Omitted, L"Other SFS: metadata only");
++  if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  if (Omitted > 0) {
++    Status = R8qPrintDiagnosticLine (&Page, &Omitted, L"+%u lines omitted", Omitted);
++    if (EFI_ERROR (Status)) {
++      goto Done;
++    }
++  }
++
++  Status = R8qWaitForDiagnosticAction (&AbortToMenu);
++  if (EFI_ERROR (Status)) {
++    goto Done;
++  }
++
++  if (AbortToMenu) {
++    Status = EFI_ABORTED;
++  }
++
++Done:
++  if (BlockHandles != NULL) {
++    FreePool (BlockHandles);
++  }
++
++  if (PartitionHandles != NULL) {
++    FreePool (PartitionHandles);
++  }
++
++  if (SfsHandles != NULL) {
++    FreePool (SfsHandles);
++  }
++
++  return Status;
++}
++
++STATIC
++EFI_STATUS
++R8qShowBootResultPage (
++  VOID
++  )
++{
++  EFI_STATUS  Status;
++  EFI_STATUS  PageStatus;
++  BOOLEAN     AbortToMenu;
++  UINTN       Omitted;
++  UINTN       Index;
++  R8Q_PAGE    Page;
++
++  Status = gBS->SetWatchdogTimer (0, 0, 0, NULL);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Status = R8qOpenDiagnosticPage (L"Boot result", &Page);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Omitted = 0;
++  Status  = R8qPrintDiagnosticLine (
++              &Page,
++              &Omitted,
++              L"select %r nohandles %u",
++              mR8qFinalSelectionStatus,
++              mR8qNoHandlesAfterFilter
++              );
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Status = R8qPrintDiagnosticLine (&Page, &Omitted, L"select code 0x%Lx", (UINT64)mR8qFinalSelectionStatus);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  if (mR8qBootOptionStatusValid) {
++    Status = R8qPrintDiagnosticLine (
++               &Page,
++               &Omitted,
++               L"boot %r",
++               mR8qLastBootOptionStatus
++               );
++  } else {
++    Status = R8qPrintDiagnosticLine (&Page, &Omitted, L"boot not called");
++  }
++
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  if (mR8qBootAttemptCount == 0) {
++    Status = R8qPrintDiagnosticLine (&Page, &Omitted, L"attempts none");
++    if (EFI_ERROR (Status)) {
++      return Status;
++    }
++  }
++
++  for (Index = 0; Index < mR8qBootAttemptCount; Index++) {
++    if ((Page.Rows + 1) >= Page.TotalRows) {
++      PageStatus = R8qWaitForDiagnosticAction (&AbortToMenu);
++      if (EFI_ERROR (PageStatus) || AbortToMenu) {
++        return EFI_ABORTED;
++      }
++
++      Status = R8qOpenDiagnosticPage (L"Boot candidate status", &Page);
++      if (EFI_ERROR (Status)) {
++        return Status;
++      }
++    }
++
++    Status = R8qPrintDiagnosticLine (
++               &Page,
++               &Omitted,
++               L"try%u C%u %r 0x%Lx",
++               mR8qBootAttempts[Index].Candidate,
++               mR8qBootAttempts[Index].IsCache,
++               mR8qBootAttempts[Index].Status,
++               (UINT64)mR8qBootAttempts[Index].Status
++               );
++    if (EFI_ERROR (Status)) {
++      return Status;
++    }
++  }
++
++  if (Omitted > 0) {
++    Status = R8qPrintDiagnosticLine (&Page, &Omitted, L"+%u lines omitted", Omitted);
++    if (EFI_ERROR (Status)) {
++      return Status;
++    }
++  }
++
++  PageStatus = R8qWaitForDiagnosticAction (&AbortToMenu);
++  if (EFI_ERROR (PageStatus)) {
++    return PageStatus;
++  }
++
++  if (AbortToMenu) {
++    return EFI_ABORTED;
++  }
++
++  return EFI_SUCCESS;
++}
++
++
+ static BOOT_SEQUENCE  mDefaultBootSequence[] = {
+   MsBootHDD,
+   MsBootUSB,
+@@ -324,6 +1442,7 @@ SelectAndBootDevice (
+   EFI_BOOT_MANAGER_LOAD_OPTION  BootOption;
+   CHAR16                        *TmpStr;
+   EFI_DEVICE_PATH_PROTOCOL      *DevicePath;
++  R8Q_CACHE_MATCH                DiagnosticCacheMatch;
+ 
+   Status = gBS->LocateHandleBuffer (
+                   ByProtocol,
+@@ -333,6 +1452,11 @@ SelectAndBootDevice (
+                   &Handles
+                   );
+   if (EFI_ERROR (Status)) {
++    if (mR8qDiagnosticActive) {
++      mR8qFinalSelectionStatus   = Status;
++      mR8qNoHandlesAfterFilter   = TRUE;
++    }
++
+     DEBUG ((DEBUG_ERROR, "Unable to locate any %g handles - code=%r\n", ByGuid, Status));
+     return Status;
+   }
+@@ -342,10 +1466,30 @@ SelectAndBootDevice (
+   FilterHandles (Handles, &HandleCount, ByFilter);
+   DEBUG ((DEBUG_INFO, "%d handles survived filtering\n", HandleCount));
+   if (HandleCount == 0) {
++    if (mR8qDiagnosticActive) {
++      mR8qFinalSelectionStatus   = EFI_NOT_FOUND;
++      mR8qNoHandlesAfterFilter   = TRUE;
++    }
++
+     DEBUG ((DEBUG_WARN, "No handles survived filtering!\n"));
++    if (mR8qDiagnosticActive) {
++      FreePool (Handles);
++    }
++
+     return EFI_NOT_FOUND;
+   }
+ 
++  if (mR8qDiagnosticActive) {
++    mR8qBootAttempts = AllocateZeroPool (
++                         HandleCount * sizeof (*mR8qBootAttempts)
++                         );
++    if (mR8qBootAttempts == NULL) {
++      mR8qFinalSelectionStatus = EFI_OUT_OF_RESOURCES;
++      FreePool (Handles);
++      return EFI_OUT_OF_RESOURCES;
++    }
++  }
++
+   SortHandles (Handles, HandleCount);
+ 
+   Status = EFI_DEVICE_ERROR;
+@@ -386,10 +1530,25 @@ SelectAndBootDevice (
+ 
+       EfiBootManagerBoot (&BootOption);
+       Status = BootOption.Status;
++      if (mR8qDiagnosticActive) {
++        mR8qLastBootOptionStatus  = BootOption.Status;
++        mR8qBootOptionStatusValid = TRUE;
++        mR8qBootAttempts[mR8qBootAttemptCount].Candidate = Index;
++        mR8qBootAttempts[mR8qBootAttemptCount].Status    = BootOption.Status;
++        mR8qBootAttempts[mR8qBootAttemptCount].IsCache   = R8qIsCacheHandle (
++                                                         Handles[Index],
++                                                         &DiagnosticCacheMatch
++                                                         );
++        mR8qBootAttemptCount++;
++      }
+ 
+       EfiBootManagerFreeLoadOption (&BootOption);
+       // if EFI_SUCCESS, device was booted, and the return is back to setup
+       if (Status == EFI_SUCCESS) {
++        if (mR8qDiagnosticActive) {
++          FreePool (TmpStr);
++        }
++
+         break;
+       }
+     } else {
+@@ -400,6 +1559,11 @@ SelectAndBootDevice (
+     FreePool (TmpStr);
+   }
+ 
++  if (mR8qDiagnosticActive) {
++    mR8qFinalSelectionStatus = Status;
++    FreePool (Handles);
++  }
++
+   return Status;
+ }
+ 
+@@ -592,8 +1756,11 @@ MsBootPolicyEntry (
+   UINTN                      Index;
+   EFI_LOADED_IMAGE_PROTOCOL  *ImageInfo = NULL;
+   CHAR8                      *Parameters;
+-  BOOLEAN                    EnableIPv6     = TRUE;
+-  BOOLEAN                    AltBootRequest = FALSE;
++  BOOLEAN                    EnableIPv6          = TRUE;
++  BOOLEAN                    AltBootRequest      = FALSE;
++  BOOLEAN                    ManualStorage       = FALSE;
++  BOOLEAN                    ManualDiagnosticAbort = FALSE;
++  EFI_STATUS                 DiagnosticStatus;
+ 
+   // At one time, there was a use for loading MsBootPolicy.efi as a DXE_DRIVER in addition as an application.
+   // This is no longer the case.  However, if we are called without parameters, still attempt a default boot.
+@@ -609,6 +1776,16 @@ MsBootPolicyEntry (
+   }
+ 
+   DEBUG ((DEBUG_INFO, "%a parameter = %a\n", __FUNCTION__, Parameters));
++  ManualStorage                 = (*Parameters == 'S');
++  mR8qDiagnosticActive          = ManualStorage;
++  mR8qBootOptionStatusValid     = FALSE;
++  mR8qFinalSelectionStatus      = EFI_NOT_READY;
++  mR8qNoHandlesAfterFilter      = FALSE;
++  mR8qBootAttemptCount          = 0;
++  if (mR8qBootAttempts != NULL) {
++    FreePool (mR8qBootAttempts);
++    mR8qBootAttempts = NULL;
++  }
+ 
+   // Entry is from BDS as a boot option.
+   switch (*Parameters) {
+@@ -670,7 +1847,27 @@ MsBootPolicyEntry (
+           DEBUG ((DEBUG_ERROR, "%a Unable to set console mode - %r\n", __FUNCTION__, GraphicStatus));
+         }
+ 
++        if (ManualStorage) {
++          DiagnosticStatus = R8qRunDiscovery ();
++          if (EFI_ERROR (DiagnosticStatus)) {
++            Status                   = DiagnosticStatus;
++            ManualDiagnosticAbort    = TRUE;
++            break;
++          }
++        }
++
+         Status = SelectAndBootDevice (&gEfiSimpleFileSystemProtocolGuid, FilterNoUSB);
++        if (ManualStorage) {
++          DiagnosticStatus = R8qShowBootResultPage ();
++          if (DiagnosticStatus == EFI_ABORTED) {
++            Status                = EFI_ABORTED;
++            ManualDiagnosticAbort = TRUE;
++          } else if (EFI_ERROR (DiagnosticStatus)) {
++            Status                = DiagnosticStatus;
++            ManualDiagnosticAbort = TRUE;
++          }
++        }
++
+         break;
+       case MsBootUSB:
+         GraphicStatus = SetGraphicsConsoleMode (GCM_NATIVE_RES);
+@@ -698,6 +1895,10 @@ MsBootPolicyEntry (
+         break;
+     }
+ 
++    if (ManualDiagnosticAbort) {
++      break;
++    }
++
+     // A Boot Option that returns EFI_SUCCESS, exits to the settings page.
+     if (Status == EFI_SUCCESS) {
+       break;
+@@ -719,6 +1920,11 @@ MsBootPolicyEntry (
+   }
+ 
+ Done:
++  if (mR8qBootAttempts != NULL) {
++    FreePool (mR8qBootAttempts);
++    mR8qBootAttempts = NULL;
++  }
++
+   DEBUG ((DEBUG_INFO, "Exit boot policy. Index=%d, BS=%d, Status=%r\n", Index, BootSequence[Index], Status));
+   return Status;
+ }
+diff --git a/PcBdsPkg/MsBootPolicy/MsBootPolicy.h b/PcBdsPkg/MsBootPolicy/MsBootPolicy.h
+index 2dcf1d4..62a0653 100644
+--- a/PcBdsPkg/MsBootPolicy/MsBootPolicy.h
++++ b/PcBdsPkg/MsBootPolicy/MsBootPolicy.h
+@@ -20,8 +20,11 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
+ #include <Protocol/Bds.h>
+ #include <Protocol/DevicePath.h>
+ #include <Protocol/LoadedImage.h>
++#include <Protocol/BlockIo.h>
++#include <Protocol/PartitionInfo.h>
+ #include <Protocol/LoadFile.h>
+ #include <Protocol/SimpleFileSystem.h>
++#include <Guid/FileInfo.h>
+ 
+ #include <Library/BaseLib.h>
+ #include <Library/BaseMemoryLib.h>
+diff --git a/PcBdsPkg/MsBootPolicy/MsBootPolicy.inf b/PcBdsPkg/MsBootPolicy/MsBootPolicy.inf
+index 430550d..0aba259 100644
+--- a/PcBdsPkg/MsBootPolicy/MsBootPolicy.inf
++++ b/PcBdsPkg/MsBootPolicy/MsBootPolicy.inf
+@@ -52,8 +52,11 @@
+   GraphicsConsoleHelperLib
+ 
+ [Guids]
++  gEfiFileInfoGuid
+ 
+ [Protocols]
++  gEfiBlockIoProtocolGuid
++  gEfiPartitionInfoProtocolGuid
+   gEfiSimpleFileSystemProtocolGuid
+   gEfiLoadFileProtocolGuid
+   gEfiLoadedImageProtocolGuid

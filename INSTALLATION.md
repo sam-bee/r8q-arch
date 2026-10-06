@@ -51,6 +51,10 @@ MUSIL=$MUSIL DTB=$OUT/arch/arm64/boot/dts/qcom/sm8250-samsung-r8q.dtb ./scripts/
 # -> $MUSIL/Mu-r8q.img (current single-model r8q target)
 ```
 
+If Mu starts but cannot discover the staged EFI kernel, the temporary
+[UEFI discovery diagnostic](UEFI-DIAGNOSTICS.md) can report runtime protocol,
+file-access and boot statuses before changing the partition layout.
+
 ## 3. Flash UEFI to BOOT
 
 Put the phone in **download mode** (power off; VolUp+VolDown; plug USB):

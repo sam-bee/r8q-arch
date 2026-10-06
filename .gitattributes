@@ -1,0 +1,2 @@
+# Upstream Mu uses CRLF; patch contexts also require a leading space.
+patches/uefi/*.patch -text whitespace=-blank-at-eol
