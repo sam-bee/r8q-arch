@@ -45,6 +45,9 @@ kernel via `DtPlatformDxe`). The build wrapper enables the "Device Tree"
 FREEFORM block in `$MUSIL/Platforms/Samsung/r8qPkg/r8q.fdf` and copies this DTB.
 Keep Mu's separate `Resources/DTBs/r8q.dtb`: that downstream Android device
 tree bootstraps UEFI and must not be replaced with the mainline DTB.
+Mu supplies the mainline DTB through the EFI configuration table; do not add
+`dtb=` to the forced command line because the staged CACHE image has no
+external DTB file.
 
 ```bash
 MUSIL=$MUSIL DTB=$OUT/arch/arm64/boot/dts/qcom/sm8250-samsung-r8q.dtb ./scripts/build-uefi.sh
