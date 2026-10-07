@@ -48,25 +48,191 @@ esp_log() {
 }
 
 # NCM gadget + telnet shell — only used on the FAILURE path (Arch's own service
-# owns the gadget on success).
+# owns the gadget on success). Wait up to 30s for a UDC, then report one
+# distinguishable stage/error without retrying or rebinding an active gadget.
+USB_UDC_ROOT=/sys/class/udc
+USB_PROC_MOUNTS=/proc/mounts
+USB_CONFIGFS_ROOT=/sys/kernel/config
+USB_DEVPTS_ROOT=/dev/pts
+USB_GADGET=$USB_CONFIGFS_ROOT/usb_gadget/g1
+USB_RESULT=not-run
+USB_STAGE=not-started
+USB_ERROR=none
+USB_UDC=none
+USB_BOUND=none
+USB_NOW_STATE=none
+
+usb_current_state() {
+    USB_NOW_UDC=$(ls "$USB_UDC_ROOT" 2>/dev/null | head -1)
+    [ -n "$USB_NOW_UDC" ] || USB_NOW_UDC=none
+    USB_NOW_BOUND=$(cat "$USB_GADGET/UDC" 2>/dev/null)
+    [ -n "$USB_NOW_BOUND" ] || USB_NOW_BOUND=none
+    if [ "$USB_NOW_UDC" = none ]; then
+        USB_NOW_STATE=none
+    else
+        USB_NOW_STATE=$(cat "$USB_UDC_ROOT/$USB_NOW_UDC/state" 2>/dev/null)
+        [ -n "$USB_NOW_STATE" ] || USB_NOW_STATE=unknown
+    fi
+}
+
+usb_status() {
+    usb_current_state
+    echo "USB status: result=$USB_RESULT stage=$USB_STAGE error=$USB_ERROR udc=$USB_NOW_UDC bound=$USB_NOW_BOUND state=$USB_NOW_STATE"
+}
+
+usb_hard_fail() {
+    USB_RESULT=failed
+    USB_ERROR=$1
+    echo "USB: stage=$USB_STAGE result=$USB_RESULT error=$USB_ERROR"
+    usb_status
+}
+
+usb_partial_fail() {
+    USB_RESULT=partial
+    if [ "$USB_ERROR" = none ]; then
+        USB_ERROR=$1
+    else
+        USB_ERROR="$USB_ERROR,$1"
+    fi
+    echo "USB: stage=$USB_STAGE result=$USB_RESULT error=$USB_ERROR"
+}
+
+usb_write() {
+    USB_FILE=$1
+    USB_VALUE=$2
+    if { echo "$USB_VALUE" > "$USB_FILE"; } 2>/dev/null; then
+        return 0
+    fi
+    USB_ERROR="write-failed:$USB_FILE"
+    return 1
+}
+
 setup_gadget() {
-    UDC=$(ls /sys/class/udc 2>/dev/null | head -1)
-    [ -n "$UDC" ] || { echo "no UDC — gadget skipped"; return 1; }
-    mount -t configfs none /sys/kernel/config 2>/dev/null
-    G=/sys/kernel/config/usb_gadget/g1
-    mkdir -p $G/strings/0x409 $G/configs/c.1/strings/0x409 $G/functions/ncm.usb0 || return 1
-    echo 0x1d6b > $G/idVendor; echo 0x0104 > $G/idProduct
-    echo "r8q-mainline" > $G/strings/0x409/product
-    echo "Samsung" > $G/strings/0x409/manufacturer
-    echo "r8q0001" > $G/strings/0x409/serialnumber
-    echo "ncm" > $G/configs/c.1/strings/0x409/configuration
-    ln -s $G/functions/ncm.usb0 $G/configs/c.1/ 2>/dev/null
-    echo "$UDC" > $G/UDC || { echo "UDC bind FAILED"; return 1; }
+    USB_STAGE=udc-wait
+    USB_RESULT=waiting
+    USB_ERROR=none
+    USB_UDC=
+    USB_WAIT=0
+    echo "USB: stage=$USB_STAGE result=$USB_RESULT wait=30s"
+    while [ "$USB_WAIT" -le 30 ]; do
+        USB_UDC=$(ls "$USB_UDC_ROOT" 2>/dev/null | head -1)
+        [ -n "$USB_UDC" ] && break
+        [ "$USB_WAIT" -eq 30 ] && break
+        sleep 1
+        USB_WAIT=$((USB_WAIT + 1))
+    done
+    if [ -z "$USB_UDC" ]; then
+        USB_UDC=none
+        USB_STAGE=udc-wait
+        USB_RESULT=unavailable
+        USB_ERROR="no-udc-after-${USB_WAIT}s"
+        echo "USB: stage=$USB_STAGE result=$USB_RESULT error=$USB_ERROR"
+        usb_status
+        return 1
+    fi
+
+    USB_STAGE=configfs-mount
+    if grep -q " $USB_CONFIGFS_ROOT configfs " "$USB_PROC_MOUNTS" 2>/dev/null; then
+        :
+    elif mount -t configfs none "$USB_CONFIGFS_ROOT" 2>/dev/null && \
+         grep -q " $USB_CONFIGFS_ROOT configfs " "$USB_PROC_MOUNTS" 2>/dev/null; then
+        :
+    else
+        usb_hard_fail mount-failed
+        return 1
+    fi
+
+    USB_BOUND=$(cat "$USB_GADGET/UDC" 2>/dev/null)
+    if [ -n "$USB_BOUND" ] && [ "$USB_BOUND" != "$USB_UDC" ]; then
+        USB_STAGE=bind
+        usb_hard_fail "already-bound-to-$USB_BOUND"
+        return 1
+    fi
+    if [ -z "$USB_BOUND" ]; then
+        USB_STAGE=gadget-create
+        if ! mkdir -p "$USB_GADGET/strings/0x409" \
+            "$USB_GADGET/configs/c.1/strings/0x409" \
+            "$USB_GADGET/functions/ncm.usb0" 2>/dev/null; then
+            usb_hard_fail directory-create-failed
+            return 1
+        fi
+
+        USB_STAGE=descriptors
+        if ! usb_write "$USB_GADGET/idVendor" 0x1d6b || \
+           ! usb_write "$USB_GADGET/idProduct" 0x0104 || \
+           ! usb_write "$USB_GADGET/strings/0x409/product" r8q-mainline || \
+           ! usb_write "$USB_GADGET/strings/0x409/manufacturer" Samsung || \
+           ! usb_write "$USB_GADGET/strings/0x409/serialnumber" r8q0001; then
+            usb_hard_fail "${USB_ERROR:-descriptor-write-failed}"
+            return 1
+        fi
+
+        USB_STAGE=configuration
+        if ! usb_write "$USB_GADGET/configs/c.1/strings/0x409/configuration" ncm; then
+            usb_hard_fail "${USB_ERROR:-configuration-write-failed}"
+            return 1
+        fi
+        USB_LINK=$USB_GADGET/configs/c.1/ncm.usb0
+        if [ -e "$USB_LINK" ] || [ -L "$USB_LINK" ]; then
+            :
+        elif ! ln -s "$USB_GADGET/functions/ncm.usb0" "$USB_LINK" 2>/dev/null; then
+            usb_hard_fail function-link-failed
+            return 1
+        fi
+    fi
+
+    USB_STAGE=bind
+    if [ -z "$USB_BOUND" ] && ! usb_write "$USB_GADGET/UDC" "$USB_UDC"; then
+        usb_hard_fail "${USB_ERROR:-bind-failed}"
+        return 1
+    fi
     sleep 2
-    ifconfig usb0 172.16.42.1 netmask 255.255.255.0 up 2>/dev/null || \
-        { ip link set usb0 up; ip addr add 172.16.42.1/24 dev usb0; } 2>/dev/null
-    mkdir -p /dev/pts; mount -t devpts devpts /dev/pts 2>/dev/null
-    telnetd -l /bin/sh -b 172.16.42.1 2>/dev/null && echo "TELNETD up on 172.16.42.1"
+
+    USB_STAGE=interface
+    USB_IFACE_OK=0
+    if ip addr show dev usb0 2>/dev/null | grep -q 'inet 172.16.42.1/24 '; then
+        ip link set usb0 up 2>/dev/null && USB_IFACE_OK=1
+    elif ifconfig usb0 172.16.42.1 netmask 255.255.255.0 up 2>/dev/null; then
+        USB_IFACE_OK=1
+    elif ip link set usb0 up 2>/dev/null && \
+         ip addr add 172.16.42.1/24 dev usb0 2>/dev/null; then
+        USB_IFACE_OK=1
+    fi
+    if [ "$USB_IFACE_OK" -ne 1 ]; then
+        usb_partial_fail usb0-setup-failed
+    elif ! ip addr show dev usb0 2>/dev/null | grep -q 'inet 172.16.42.1/24 '; then
+        usb_partial_fail usb0-address-not-172.16.42.1/24
+    elif ! ip link show dev usb0 2>/dev/null | grep -Eq '<([^>]*,)?UP(,|>)'; then
+        usb_partial_fail usb0-link-not-up
+    fi
+
+    USB_STAGE=devpts
+    USB_DEVPTS_OK=0
+    if ! mkdir -p "$USB_DEVPTS_ROOT" 2>/dev/null; then
+        usb_partial_fail devpts-directory-create-failed
+    elif grep -q " $USB_DEVPTS_ROOT devpts " "$USB_PROC_MOUNTS" 2>/dev/null; then
+        USB_DEVPTS_OK=1
+    elif mount -t devpts devpts "$USB_DEVPTS_ROOT" 2>/dev/null && \
+         grep -q " $USB_DEVPTS_ROOT devpts " "$USB_PROC_MOUNTS" 2>/dev/null; then
+        USB_DEVPTS_OK=1
+    else
+        usb_partial_fail devpts-mount-failed
+    fi
+
+    if [ "$USB_DEVPTS_OK" -eq 1 ]; then
+        USB_STAGE=telnet
+        if telnetd -l /bin/sh -b 172.16.42.1 2>/dev/null; then
+            echo "TELNETD up on 172.16.42.1"
+        else
+            usb_partial_fail telnetd-launch-failed
+        fi
+    fi
+
+    USB_STAGE=complete
+    [ "$USB_RESULT" = waiting ] && USB_RESULT=ready
+    [ "$USB_RESULT" = ready ] && USB_ERROR=none
+    usb_status
+    return 0
 }
 
 # ---- wait for userdata (UFS is fast, but be patient), then switch_root --------
@@ -112,5 +278,6 @@ setup_gadget
 i=0
 while true; do
     echo "==== [arch-fail hb $i uptime $($BB cut -d' ' -f1 /proc/uptime)s] root='$ROOT' REASON: $REASON ===="
+    usb_status
     i=$((i+1)); sleep 20
 done
