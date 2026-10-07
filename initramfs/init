@@ -63,7 +63,7 @@ USB_BOUND=none
 USB_NOW_STATE=none
 
 usb_current_state() {
-    USB_NOW_UDC=$(ls "$USB_UDC_ROOT" 2>/dev/null | head -1)
+    USB_NOW_UDC=$(ls "$USB_UDC_ROOT" 2>/dev/null | head -n 1)
     [ -n "$USB_NOW_UDC" ] || USB_NOW_UDC=none
     USB_NOW_BOUND=$(cat "$USB_GADGET/UDC" 2>/dev/null)
     [ -n "$USB_NOW_BOUND" ] || USB_NOW_BOUND=none
@@ -115,7 +115,7 @@ setup_gadget() {
     USB_WAIT=0
     echo "USB: stage=$USB_STAGE result=$USB_RESULT wait=30s"
     while [ "$USB_WAIT" -le 30 ]; do
-        USB_UDC=$(ls "$USB_UDC_ROOT" 2>/dev/null | head -1)
+        USB_UDC=$(ls "$USB_UDC_ROOT" 2>/dev/null | head -n 1)
         [ -n "$USB_UDC" ] && break
         [ "$USB_WAIT" -eq 30 ] && break
         sleep 1
@@ -273,7 +273,7 @@ fi
 # ---- FAILURE: debug mode -------------------------------------------------------
 mount -t proc proc /proc 2>/dev/null; mount -t sysfs sysfs /sys 2>/dev/null
 echo "!! ARCH BOOT FAILED: $REASON"
-{ echo "FAIL uptime $($BB cut -d' ' -f1 /proc/uptime)s: $REASON"; dmesg | tail -40; } | esp_log switchroot-fail.txt
+{ echo "FAIL uptime $($BB cut -d' ' -f1 /proc/uptime)s: $REASON"; dmesg | tail -n 40; } | esp_log switchroot-fail.txt
 setup_gadget
 i=0
 while true; do
