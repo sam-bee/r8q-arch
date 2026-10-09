@@ -149,43 +149,66 @@ gsettings set org.gnome.desktop.media-handling automount "$S20_AUTOMOUNT_OLD"
 gsettings set org.gnome.desktop.media-handling automount-open "$S20_AUTOMOUNT_OPEN_OLD"
 ```
 
-## 6. Install Arch onto userdata
+## 6. Prepare the first Arch root filesystem locally
 
-Still in mass-storage mode (this **formats userdata**):
+Verify the generic AArch64 archive's signature against the fingerprint on the
+[Arch Linux ARM download page](https://archlinuxarm.org/about/downloads), then
+pin its SHA256. The current first-boot helper creates a fresh staging tree at
+`out/arch-preparation-20261009/rootdir`; it does not select a disk or write to
+the phone. It needs the host's `bsdtar` and OpenSSL and runs as root to preserve
+archive ownership, ACLs, and extended attributes:
 
 ```bash
-KV=7.1.2 OUT=$OUT KSRC=$KSRC ./scripts/install-arch.sh
+pkexec /usr/bin/python3 scripts/prepare-arch-rootfs.py \
+  /absolute/path/to/verified-ArchLinuxARM-aarch64.tar.gz \
+  THE_VERIFIED_ARCHIVE_SHA256
 ```
 
-It extracts Arch Linux ARM, **moves the kernel module tree aside** (cold-plugging
-the full tree hard-resets the SoC — see the note in the script), lays down our
-[`rootfs/`](rootfs/) overlay, enables `sshd` + `systemd-networkd` +
-`r8q-usb-gadget`, sets root autologin on `tty1`, root password `root`, and
-disables the pacman sandbox (our kernel has no Landlock).
+It prepares USB NCM, local USB networking, SSH, and tty1 root autologin. The
+temporary root password is `root`. Stock module trees are moved out of the
+module search path, and sleep targets are masked. Optional hardware and GUI
+services remain disabled until the first SSH boot works. Numeric archive
+ownership is retained, including the `alarm` home directory; only top-level
+root ownership and generated configuration files are normalized.
+
+Prepare and review an ext4 `archroot` candidate for the exact USERDATA extent,
+and rebuild the kernel in normal `arch` mode. Deployment **replaces USERDATA**
+and updates CACHE with that kernel. Bind each write to a fresh observed Mu USB
+parent and reviewed LU0/GPT/PIT mapping, use a candidate-specific one-shot
+writer, and verify readback. Preserve BOOT, VBMETA, and the remaining partitions.
+
+Do not run the legacy `scripts/install-arch.sh` for this route: its global
+PARTLABEL scan does not establish the target phone or partition identity.
 
 ## 7. Boot
 
-Exit mass storage and let the phone boot. You should see the panel show the
+After both image writes and readback checks pass, exit mass storage and let the phone boot. You should see the panel show the
 switch-root message, then systemd, then a root shell (autologin). On the PC an
 NCM network device appears:
 
 ```bash
 DEV=<the new cdc_ncm netdev>
-sudo ip addr add 172.16.42.14/24 dev "$DEV"; sudo ip link set "$DEV" up
+sudo ip addr add 172.16.42.2/24 dev "$DEV"
+sudo ip link set "$DEV" up
 ssh root@172.16.42.1            # password: root
+# After recording the first-boot results and exiting SSH:
+sudo ip addr del 172.16.42.2/24 dev "$DEV"
 ```
 
 ## 8. USB tethering (internet + pacman)
 
-Share the PC's internet to the phone (host NAT is runtime — re-run after a PC
-reboot):
+This and the following hardware stages are later work, after the first local
+SSH boot is verified. The minimal prepared tree has no gateway or DNS.
+Internet sharing needs a separately configured phone gateway/DNS and host NAT
+(host NAT is runtime — re-run after a PC reboot):
 
 ```bash
 ./scripts/host-tether.sh        # enables ip_forward + MASQUERADE for 172.16.42.0/24
 ```
 
-The phone already has `Gateway=172.16.42.14` + DNS baked into
-`rootfs/etc/systemd/network/20-usb0.network`, so once the host NAT is up:
+The full `rootfs/` overlay contains `Gateway=172.16.42.14` and DNS in
+`rootfs/etc/systemd/network/20-usb0.network`; the minimal preparation helper
+does not copy those settings. Once the phone network and host NAT are configured:
 
 ```bash
 ssh root@172.16.42.1 'ping -c2 archlinux.org'

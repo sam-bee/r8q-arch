@@ -1,9 +1,12 @@
 [Unit]
 Description=r8q USB NCM gadget (ssh over USB)
-After=multi-user.target
+Wants=network-pre.target
+Before=network-pre.target
+
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/r8q-usb-gadget-up.sh
+
 [Install]
 WantedBy=multi-user.target
