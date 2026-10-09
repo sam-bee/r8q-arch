@@ -1,0 +1,335 @@
+#!/bin/sh
+# Persist the PMIC RTC UEFI offset across Mu boots.
+#
+# The kernel's rtc-pm8xxx driver consumes one exact efivarfs record:
+#   4-byte EFI attributes (07 00 00 00), then a 12-byte RTCInfo payload.
+# The root filesystem carries that record as an 81-byte transaction:
+#   64 lower-case SHA-256 characters, newline, and the 16 EFI bytes.
+# The hash covers all 16 EFI bytes, including the EFI attributes.
+#
+# This helper deliberately has no clock-setting operation.  A successful
+# restore only creates the exact EFI variable (when absent) and binds the
+# expected platform device; registration performs the kernel's HCTOSYS step.
+
+set -eu
+umask 077
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+export PATH
+
+ROOT_DEVICE=/dev/sda36
+ROOT_UUID=217b9308-40c7-4eb0-90a9-09ed4e233173
+EXPECTED_HOSTNAME=r8q
+EXPECTED_MODEL='Samsung Galaxy S20 FE'
+DT_RTC_DIR=/sys/firmware/devicetree/base/soc@0/spmi@c440000/pmic@0/rtc@6000
+EFI_DIR=/sys/firmware/efi/efivars
+EFI_NAME=RTCInfo-882f8c2b-9646-435f-8de5-f208ff80c1bd
+EFI_VAR=$EFI_DIR/$EFI_NAME
+DRIVER_DIR=/sys/bus/platform/drivers/rtc-pm8xxx
+DEVICE_NAME=c440000.spmi:pmic@0:rtc@6000
+EXPECTED_RTC_NAME="rtc-pm8xxx $DEVICE_NAME"
+RTC_DEVICE=$DRIVER_DIR/$DEVICE_NAME
+RTC0_DIR=/sys/class/rtc/rtc0
+STATE_DIR=/var/lib/r8q-rtc
+STATE_FILE=$STATE_DIR/rtcinfo.state
+IDENTITY_FILE=$STATE_DIR/machine-id
+LOCK_DIR=/run/r8q-rtc.lock
+
+TMP_STATE_HEAD=
+TMP_PAYLOAD=
+TMP_VARIABLE=
+TMP_STATE=
+LOCK_HELD=0
+
+die()
+{
+	printf 'r8q-rtc-state: %s\n' "$*" >&2
+	exit 1
+}
+
+cleanup()
+{
+	[ -z "$TMP_STATE_HEAD" ] || rm -f -- "$TMP_STATE_HEAD"
+	[ -z "$TMP_PAYLOAD" ] || rm -f -- "$TMP_PAYLOAD"
+	[ -z "$TMP_VARIABLE" ] || rm -f -- "$TMP_VARIABLE"
+	[ -z "$TMP_STATE" ] || rm -f -- "$TMP_STATE"
+	if [ "$LOCK_HELD" -eq 1 ]; then
+		rmdir -- "$LOCK_DIR" 2>/dev/null || true
+	fi
+}
+
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+require_root()
+{
+	[ "$(id -u)" = 0 ] || die 'must run as root'
+}
+
+acquire_lock()
+{
+	if ! mkdir -- "$LOCK_DIR" 2>/dev/null; then
+		die 'another restore/save operation holds /run/r8q-rtc.lock'
+	fi
+	LOCK_HELD=1
+}
+
+require_identity()
+{
+	root_source=$(findmnt -rn -o SOURCE / 2>/dev/null || true)
+	[ "$root_source" = "$ROOT_DEVICE" ] || die "root source is not $ROOT_DEVICE"
+	root_uuid=$(blkid -s UUID -o value "$ROOT_DEVICE" 2>/dev/null || true)
+	root_uuid=$(printf '%s' "$root_uuid" | tr 'A-F' 'a-f')
+	[ "$root_uuid" = "$ROOT_UUID" ] || die 'root filesystem UUID mismatch'
+
+	[ -r /etc/hostname ] || die 'hostname file is missing'
+	[ "$(tr -d '\r\n' < /etc/hostname)" = "$EXPECTED_HOSTNAME" ] || die 'hostname mismatch'
+
+	[ -r /sys/firmware/devicetree/base/model ] || die 'device-tree model is missing'
+	model=$(tr -d '\000\r\n' < /sys/firmware/devicetree/base/model)
+	[ "$model" = "$EXPECTED_MODEL" ] || die 'device-tree model mismatch'
+	[ -d "$DT_RTC_DIR" ] || die 'expected PMIC RTC device-tree node is missing'
+	[ -e "$DT_RTC_DIR/qcom,uefi-rtc-info" ] || die 'qcom,uefi-rtc-info is missing'
+	[ ! -e "$DT_RTC_DIR/allow-set-time" ] || die 'allow-set-time must remain absent'
+
+	[ ! -L "$STATE_DIR" ] || die 'state directory must not be a symlink'
+	[ -d "$STATE_DIR" ] || mkdir -p -- "$STATE_DIR"
+	chmod 700 -- "$STATE_DIR"
+	[ -f /etc/machine-id ] || die 'machine-id is missing'
+	[ -f "$IDENTITY_FILE" ] || die 'RTC machine-id guard is missing'
+	[ ! -L "$IDENTITY_FILE" ] || die 'RTC machine-id guard must not be a symlink'
+	machine_id=$(tr -d '\r\n' < /etc/machine-id)
+	saved_machine_id=$(tr -d '\r\n' < "$IDENTITY_FILE")
+	[ -n "$machine_id" ] || die 'machine-id is empty'
+	[ "$saved_machine_id" = "$machine_id" ] || die 'RTC machine-id guard mismatch'
+}
+
+ensure_efivarfs()
+{
+	[ -d "$EFI_DIR" ] || die 'efivarfs directory is missing'
+	efivarfs_mounted=0
+	while read -r mount_source mount_target mount_type mount_options mount_rest; do
+		if [ "$mount_target" = "$EFI_DIR" ]; then
+			[ "$mount_type" = efivarfs ] || die 'EFI variable path has the wrong filesystem'
+			efivarfs_mounted=1
+		fi
+	done < /proc/mounts
+	if [ "$efivarfs_mounted" -eq 0 ]; then
+		mount -t efivarfs efivarfs "$EFI_DIR" || die 'could not mount efivarfs'
+	fi
+
+	efivarfs_mounted=0
+	while read -r mount_source mount_target mount_type mount_options mount_rest; do
+		if [ "$mount_target" = "$EFI_DIR" ] && [ "$mount_type" = efivarfs ]; then
+			efivarfs_mounted=1
+		fi
+	done < /proc/mounts
+	[ "$efivarfs_mounted" -eq 1 ] || die 'efivarfs did not become mounted'
+}
+
+file_size_at_most()
+{
+	# head bounds reads from files whose length is not trusted.
+	[ "$(head -c "$2" "$1" | wc -c)" -eq "$2" ]
+}
+
+hex_bytes()
+{
+	od -An -tx1 "$1" | tr -d ' \n\r\t'
+}
+
+validate_payload()
+{
+	payload_file=$1
+	[ -f "$payload_file" ] || die 'RTC payload is not a regular file'
+	file_size_at_most "$payload_file" 16 || die 'RTC payload is not exactly 16 bytes'
+	[ "$(head -c 17 "$payload_file" | wc -c)" -eq 16 ] || die 'RTC payload has trailing bytes'
+	[ "$(od -An -tx1 -N4 "$payload_file" | tr -d ' \n\r\t')" = 07000000 ] || die 'RTC EFI attributes are not exactly 0x00000007'
+	[ "$(od -An -tx1 -j8 -N8 "$payload_file" | tr -d ' \n\r\t')" = 0000000000000000 ] || die 'RTCInfo reserved bytes are not zero'
+
+	# The four GPS-offset bytes are inherently bounded by the exact u32 field.
+	# Decode them to exercise every byte without ever accepting a signed value.
+	payload_b0=$(od -An -tu1 -j4 -N1 "$payload_file" | tr -d ' \n\r\t')
+	payload_b1=$(od -An -tu1 -j5 -N1 "$payload_file" | tr -d ' \n\r\t')
+	payload_b2=$(od -An -tu1 -j6 -N1 "$payload_file" | tr -d ' \n\r\t')
+	payload_b3=$(od -An -tu1 -j7 -N1 "$payload_file" | tr -d ' \n\r\t')
+	case "$payload_b0$payload_b1$payload_b2$payload_b3" in
+		*[!0-9]*) die 'RTC GPS offset contains a non-byte value' ;;
+		'') die 'RTC GPS offset is empty' ;;
+	esac
+	payload_gps=$((payload_b0 + payload_b1 * 256 + payload_b2 * 65536 + payload_b3 * 16777216))
+	[ "$payload_gps" -ge 0 ] || die 'RTC GPS offset is negative'
+}
+
+read_variable_exact()
+{
+	variable_source=$1
+	variable_destination=$2
+	[ -e "$variable_source" ] || die 'RTCInfo variable is absent after creation'
+	head -c 17 "$variable_source" > "$variable_destination" || die 'could not read RTCInfo variable'
+	[ "$(wc -c < "$variable_destination")" -eq 16 ] || die 'RTCInfo variable is not exactly 16 bytes'
+	[ "$(head -c 17 "$variable_source" | wc -c)" -eq 16 ] || die 'RTCInfo variable has trailing bytes'
+}
+
+validate_state()
+{
+	state_source=$1
+	[ -f "$state_source" ] || die 'RTC state file is missing'
+	[ ! -L "$state_source" ] || die 'RTC state file must not be a symlink'
+	[ -z "$TMP_STATE_HEAD" ] || rm -f -- "$TMP_STATE_HEAD"
+	[ -z "$TMP_PAYLOAD" ] || rm -f -- "$TMP_PAYLOAD"
+	TMP_STATE_HEAD=$(mktemp /run/r8q-rtc-state-head.XXXXXX)
+	head -c 82 "$state_source" > "$TMP_STATE_HEAD" || die 'could not read RTC state file'
+	[ "$(wc -c < "$TMP_STATE_HEAD")" -eq 81 ] || die 'RTC state file is not exactly 81 bytes'
+	state_newline=$(od -An -tx1 -j64 -N1 "$TMP_STATE_HEAD" | tr -d ' \n\r\t')
+	[ "$state_newline" = 0a ] || die 'RTC state hash is not followed by a newline'
+	state_hash=$(head -c 64 "$TMP_STATE_HEAD")
+	[ "${#state_hash}" -eq 64 ] || die 'RTC state hash length is invalid'
+	case "$state_hash" in
+		*[!0123456789abcdefABCDEF]*) die 'RTC state hash is not hexadecimal' ;;
+	esac
+	state_hash=$(printf '%s' "$state_hash" | tr 'A-F' 'a-f')
+
+	TMP_PAYLOAD=$(mktemp /run/r8q-rtc-payload.XXXXXX)
+	tail -c 16 "$TMP_STATE_HEAD" > "$TMP_PAYLOAD"
+	validate_payload "$TMP_PAYLOAD"
+	actual_hash=$(sha256sum "$TMP_PAYLOAD")
+	actual_hash=${actual_hash%% *}
+	[ "$state_hash" = "$actual_hash" ] || die 'RTC state hash does not match its payload'
+}
+
+assert_rtc0()
+{
+	[ -e "$RTC0_DIR/name" ] || die 'rtc0 is not registered'
+	[ "$(cat "$RTC0_DIR/name")" = "$EXPECTED_RTC_NAME" ] || die 'rtc0 is not the expected rtc-pm8xxx device'
+	[ -e "$RTC0_DIR/hctosys" ] || die 'rtc0 hctosys marker is missing'
+	[ "$(cat "$RTC0_DIR/hctosys")" = 1 ] || die 'rtc0 did not perform HCTOSYS'
+	[ -e "$RTC_DEVICE" ] || die 'expected PMIC RTC driver device is not bound'
+}
+
+flush_error_count()
+{
+	command -v dmesg >/dev/null 2>&1 || die 'dmesg is required to audit RTC offset flush'
+	command -v grep >/dev/null 2>&1 || die 'grep is required to audit RTC offset flush'
+	dmesg >/dev/null 2>&1 || die 'kernel log is not readable for RTC offset flush audit'
+	dmesg | grep -F -c 'failed to flush RTC offset' || true
+}
+
+restore()
+{
+	require_identity
+	ensure_efivarfs
+	validate_state "$STATE_FILE"
+	chmod 600 -- "$STATE_FILE"
+
+	if [ -e "$RTC0_DIR/name" ]; then
+		# A normal, already-bound RTC is a safe no-op.  Never disturb it.
+		# Its current EFI record may include a newer NTP offset than the
+		# bootstrap state, so validate its shape without comparing it to the
+		# durable state transaction.
+		assert_rtc0
+		if [ -e "$EFI_VAR" ]; then
+			TMP_VARIABLE=$(mktemp /run/r8q-rtc-variable.XXXXXX)
+			read_variable_exact "$EFI_VAR" "$TMP_VARIABLE"
+			validate_payload "$TMP_VARIABLE"
+		fi
+		return 0
+	fi
+	[ ! -e "$RTC_DEVICE/rtc" ] || die 'PMIC RTC driver is half-bound without rtc0'
+
+	if [ -e "$EFI_VAR" ]; then
+		TMP_VARIABLE=$(mktemp /run/r8q-rtc-variable.XXXXXX)
+		read_variable_exact "$EFI_VAR" "$TMP_VARIABLE"
+		validate_payload "$TMP_VARIABLE"
+		[ "$(hex_bytes "$TMP_VARIABLE")" = "$(hex_bytes "$TMP_PAYLOAD")" ] || die 'existing RTCInfo variable differs from the validated state'
+	else
+		# One complete write creates only the exact RTCInfo variable.  No EFI
+		# variable is overwritten by this helper.
+		base64_payload=$(base64 "$TMP_PAYLOAD")
+		base64_payload=$(printf '%s' "$base64_payload" | tr -d '\n\r')
+		printf '%s' "$base64_payload" | base64 -d > "$EFI_VAR" || die 'could not create RTCInfo variable'
+		TMP_VARIABLE=$(mktemp /run/r8q-rtc-variable.XXXXXX)
+		read_variable_exact "$EFI_VAR" "$TMP_VARIABLE"
+		validate_payload "$TMP_VARIABLE"
+		[ "$(hex_bytes "$TMP_VARIABLE")" = "$(hex_bytes "$TMP_PAYLOAD")" ] || die 'RTCInfo variable readback differs from state'
+	fi
+
+	[ -w "$DRIVER_DIR/bind" ] || die 'rtc-pm8xxx bind control is unavailable'
+	printf '%s\n' "$DEVICE_NAME" > "$DRIVER_DIR/bind" || die 'rtc-pm8xxx bind failed'
+	i=0
+	while [ "$i" -lt 20 ]; do
+		if [ -e "$RTC0_DIR/name" ]; then
+			break
+		fi
+		i=$((i + 1))
+		sleep 1
+	done
+	assert_rtc0
+}
+
+save()
+{
+	require_identity
+	ensure_efivarfs
+	[ ! -L "$STATE_FILE" ] || die 'RTC state file must not be a symlink'
+	assert_rtc0
+	[ -e "$EFI_VAR" ] || die 'RTCInfo variable is missing before shutdown save'
+	flush_errors_before=$(flush_error_count)
+	case "$flush_errors_before" in
+		*[!0-9]*|'') die 'could not count existing RTC offset flush errors' ;;
+	esac
+
+	# The patched driver's normal platform unbind flushes offset_dirty while
+	# holding its RTC operations lock.  Read the EFI record only afterwards.
+	[ -w "$DRIVER_DIR/unbind" ] || die 'rtc-pm8xxx unbind control is unavailable'
+	printf '%s\n' "$DEVICE_NAME" > "$DRIVER_DIR/unbind" || die 'rtc-pm8xxx unbind failed'
+	i=0
+	while [ "$i" -lt 20 ]; do
+		if [ ! -e "$RTC0_DIR/name" ] && [ ! -e "$RTC_DEVICE" ]; then
+			break
+		fi
+		i=$((i + 1))
+		sleep 1
+	done
+	[ ! -e "$RTC0_DIR/name" ] || die 'rtc0 remained bound after unbind'
+	[ ! -e "$RTC_DEVICE" ] || die 'PMIC RTC driver device remained bound after unbind'
+	flush_errors_after=$(flush_error_count)
+	case "$flush_errors_after" in
+		*[!0-9]*|'') die 'could not count RTC offset flush errors after unbind' ;;
+	esac
+	[ "$flush_errors_after" -le "$flush_errors_before" ] || die 'kernel reported an RTC offset flush error'
+
+	TMP_VARIABLE=$(mktemp /run/r8q-rtc-variable.XXXXXX)
+	read_variable_exact "$EFI_VAR" "$TMP_VARIABLE"
+	validate_payload "$TMP_VARIABLE"
+	variable_hash=$(sha256sum "$TMP_VARIABLE")
+	variable_hash=${variable_hash%% *}
+
+	TMP_STATE=$(mktemp "$STATE_DIR/.rtcinfo.state.tmp.XXXXXX")
+	chmod 600 -- "$TMP_STATE"
+	printf '%s\n' "$variable_hash" > "$TMP_STATE"
+	cat "$TMP_VARIABLE" >> "$TMP_STATE"
+	validate_state "$TMP_STATE"
+	sync -f "$TMP_STATE"
+	mv -f -- "$TMP_STATE" "$STATE_FILE"
+	TMP_STATE=
+	chmod 600 -- "$STATE_FILE"
+	sync -f "$STATE_DIR"
+	sync -f "$STATE_FILE"
+}
+
+require_root
+acquire_lock
+
+case "${1-}" in
+	restore)
+		[ "$#" -eq 1 ] || die 'usage: r8q-rtc-state restore|save'
+		restore
+		;;
+	save)
+		[ "$#" -eq 1 ] || die 'usage: r8q-rtc-state restore|save'
+		save
+		;;
+	*)
+		die 'usage: r8q-rtc-state restore|save'
+		;;
+esac

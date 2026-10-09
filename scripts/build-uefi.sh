@@ -2,7 +2,8 @@
 #
 # Embed our kernel-built DTB into Mu-Silicium and build the UEFI boot image.
 # The DTB (with the display fix: dispcc protected-clocks + framebuffer MDSS_GDSC
-# power-domain) lives INSIDE the firmware, so any DTB change needs a re-flash.
+# power-domain) supplies the firmware's baseline DTB. The RTC kernel can also
+# load /EFI/BOOT/R8Q-RTC.DTB from the ESP, without rebuilding this firmware.
 #
 # Env: MUSIL=<Mu-Silicium checkout>  DTB=<out/.../sm8250-samsung-r8q.dtb>
 set -euo pipefail

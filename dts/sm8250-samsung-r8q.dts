@@ -260,7 +260,7 @@
 
 &pm8150_0 {
 	rtc@6000 {
-		allow-set-time;
+		qcom,uefi-rtc-info;
 	};
 };
 

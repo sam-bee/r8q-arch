@@ -40,14 +40,15 @@ Outputs: `$OUT/arch/arm64/boot/Image` and
 
 ## 2. Embed the DTB and build UEFI
 
-The mainline DTB lives **inside the firmware** (Mu-Silicium exposes it to the
-kernel via `DtPlatformDxe`). The build wrapper enables the "Device Tree"
+Mu-Silicium contains a baseline mainline DTB exposed via `DtPlatformDxe`.
+The build wrapper enables the "Device Tree"
 FREEFORM block in `$MUSIL/Platforms/Samsung/r8qPkg/r8q.fdf` and copies this DTB.
 Keep Mu's separate `Resources/DTBs/r8q.dtb`: that downstream Android device
 tree bootstraps UEFI and must not be replaced with the mainline DTB.
-Mu supplies the mainline DTB through the EFI configuration table; do not add
-`dtb=` to the forced command line because the staged CACHE image has no
-external DTB file.
+The RTC configuration loads `/EFI/BOOT/R8Q-RTC.DTB` from the same ESP as the
+kernel, using the built-in `dtb=` argument and EFI stub loader. Deploy that
+file with every matching kernel Image. This allows Linux DT changes without
+rebuilding Mu. UEFI Secure Boot must be disabled for the external DTB loader.
 
 ```bash
 MUSIL=$MUSIL DTB=$OUT/arch/arm64/boot/dts/qcom/sm8250-samsung-r8q.dtb ./scripts/build-uefi.sh
@@ -130,24 +131,35 @@ CACHE partition (UFS logical block is 4096):
 sudo mkfs.vfat -F 32 -S 4096 -n R8QESP "$ESP"
 ```
 
-## 5. Deploy the kernel Image to the ESP
+## 5. Deploy the kernel Image and DTB to the ESP
 
-Still in mass-storage mode, use the already verified `ESP` explicitly. The
-legacy `scripts/deploy-esp.sh` performs an unguarded global PARTLABEL scan, so
-do not run it for this flow:
+Still in mass-storage mode, use the already verified `ESP` explicitly. For an
+initial empty ESP, copy and verify both files:
 
 ```bash
 S20_ESP_MNT=$(mktemp -d)
 sudo mount "$ESP" "$S20_ESP_MNT"
 sudo mkdir -p "$S20_ESP_MNT/EFI/BOOT"
 sudo cp "$OUT/arch/arm64/boot/Image" "$S20_ESP_MNT/EFI/BOOT/BOOTAA64.EFI"
+sudo cp "$OUT/arch/arm64/boot/dts/qcom/sm8250-samsung-r8q.dtb" "$S20_ESP_MNT/EFI/BOOT/R8Q-RTC.DTB"
 sync
 sudo cmp "$OUT/arch/arm64/boot/Image" "$S20_ESP_MNT/EFI/BOOT/BOOTAA64.EFI"
+sudo cmp "$OUT/arch/arm64/boot/dts/qcom/sm8250-samsung-r8q.dtb" "$S20_ESP_MNT/EFI/BOOT/R8Q-RTC.DTB"
 sudo umount "$S20_ESP_MNT"
 rmdir "$S20_ESP_MNT"
 gsettings set org.gnome.desktop.media-handling automount "$S20_AUTOMOUNT_OLD"
 gsettings set org.gnome.desktop.media-handling automount-open "$S20_AUTOMOUNT_OPEN_OLD"
 ```
+
+For the first RTC update to an existing ESP, the helper retains the old EFI
+kernel and refuses to overwrite existing backups or an external DTB:
+
+```bash
+ESP="$ESP" ./scripts/deploy-esp.sh "$OUT/arch/arm64/boot/Image" \
+  "$OUT/arch/arm64/boot/dts/qcom/sm8250-samsung-r8q.dtb"
+```
+
+Later updates must preserve both previous files before replacing either.
 
 ## 6. Prepare the first Arch root filesystem locally
 
@@ -258,10 +270,39 @@ curl -4 --fail --connect-timeout 5 --max-time 15 -I https://archlinuxarm.org/
 
 Expect `NTPSynchronized` to return `b true`, a responding NTP server and
 nonzero packet count, and HTTPS success. Compare the phone's UTC date with the
-laptop's synchronised clock. The EFI RTC (`rtc0`) currently fails to read,
-which also breaks general `timedatectl show`; the PMIC RTC (`rtc1`) reads as
-January 1970. NTP corrects system time and saves a timestamp for later boots;
-offline time across power loss remains unverified. See the
+laptop's synchronised clock. The original kernel selected Mu's dummy EFI RTC
+as `rtc0`; that clock returned an invalid date and broke `timedatectl show`.
+The RTC configuration disables that driver and uses the PM8150 counter as
+`rtc0`. Firmware protects its counter registers from writes. The upstream
+`qcom,uefi-rtc-info` path adds a UTC offset without changing those registers.
+Mu's EFI variable store is volatile, so `r8q-rtc.service` restores its exact
+`RTCInfo` record from `/var/lib/r8q-rtc/rtcinfo.state` before binding the driver
+and saves it again on shutdown. Patch 0009 flushes small pending offset changes
+when the driver is unbound. Install the helper and service from the rootfs
+overlay, preserve the device's machine-id guard and state, and enable the unit.
+
+The first bootstrap requires a verified NTP date and raw PMIC counter sample
+before switching to the offset DTB. It creates a 12-byte Qualcomm payload
+(four-byte GPS offset plus eight reserved zero bytes), with EFI attributes 7,
+and saves the hashed record on the root filesystem. This phone's bootstrap
+and guarded deployment are recorded in `project-log/2026-10-09/17-native-rtc-fix.md`
+at the project root. Do not reuse another device's offset. A fresh rootfs needs
+its own bootstrap; `hwclock --systohc` alone cannot initialise an absent RTCInfo
+variable because the driver has not yet registered.
+
+After the initial bootstrap, verify the restored clock and normal offset API:
+
+```bash
+systemctl is-enabled r8q-rtc.service
+systemctl is-active r8q-rtc.service
+cat /sys/class/rtc/rtc0/name /sys/class/rtc/rtc0/hctosys
+hwclock --show --utc --noadjfile --rtc=/dev/rtc0
+timedatectl status
+```
+
+Verify the date after a restart and a power-off with timesyncd temporarily
+masked before considering offline retention proven. Restore and enable
+timesyncd afterwards. NTP also saves a timestamp for later boots; see the
 [systemd-timesyncd documentation](https://github.com/systemd/systemd/blob/main/man/systemd-timesyncd.service.xml).
 Future package/key bootstrap must wait for verified NTP and use a full update;
 do not run an isolated `pacman -Sy` in this step.

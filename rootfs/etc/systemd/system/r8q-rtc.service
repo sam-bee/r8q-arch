@@ -1,0 +1,19 @@
+[Unit]
+Description=r8q PMIC RTCInfo restore and persistent shutdown save
+DefaultDependencies=no
+RequiresMountsFor=/var/lib/r8q-rtc
+After=local-fs.target systemd-remount-fs.service
+Before=sysinit.target systemd-timesyncd.service time-set.target umount.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UMask=0077
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+ExecStart=/usr/local/sbin/r8q-rtc-state restore
+ExecStop=/usr/local/sbin/r8q-rtc-state save
+
+[Install]
+WantedBy=sysinit.target

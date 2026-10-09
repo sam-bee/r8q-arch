@@ -1,0 +1,77 @@
+From 4c58a9ee7544a7c12c9755ce06f7f7fe9dcf1b08 Mon Sep 17 00:00:00 2001
+From: r8q-arch <r8q-arch@example.invalid>
+Date: Fri, 9 Oct 2026 23:00:00 +0100
+Subject: [PATCH] rtc: pm8xxx: flush UEFI offset on driver removal
+
+The UEFI offset path may leave offset_dirty set after RTC_SET_TIME. The
+existing shutdown callback already writes that offset through efivarfs without
+touching the PMIC counter. Use the same flush helper for normal platform
+driver removal so a userspace late-bind/unbind cycle can flush the value
+explicitly. Serialize the flush with RTC operations and clear the RTC ops
+pointer first, matching the RTC core's devm teardown ordering. Keep the dirty
+flag set and log the exact error if the EFI/NVMEM write fails.
+
+Signed-off-by: r8q-arch <r8q-arch@example.invalid>
+---
+ drivers/rtc/rtc-pm8xxx.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/drivers/rtc/rtc-pm8xxx.c b/drivers/rtc/rtc-pm8xxx.c
+index 0c4f8a8d6c9a..0c4f8a8d6c9a 100644
+--- a/drivers/rtc/rtc-pm8xxx.c
++++ b/drivers/rtc/rtc-pm8xxx.c
+@@ -660,20 +660,46 @@
+ 	return devm_rtc_register_device(rtc_dd->rtc);
+ }
+ 
++static void pm8xxx_flush_offset(struct pm8xxx_rtc *rtc_dd)
++{
++	int rc;
++
++	if (!rtc_dd->offset_dirty)
++		return;
++
++	if (rtc_dd->nvmem_cell)
++		rc = pm8xxx_rtc_write_nvmem_offset(rtc_dd, rtc_dd->offset);
++	else
++		rc = pm8xxx_rtc_write_uefi_offset(rtc_dd, rtc_dd->offset);
++
++	if (rc)
++		dev_err(rtc_dd->dev, "failed to flush RTC offset: %d\n", rc);
++	else
++		rtc_dd->offset_dirty = false;
++}
++
+ static void pm8xxx_shutdown(struct platform_device *pdev)
+ {
+ 	struct pm8xxx_rtc *rtc_dd = platform_get_drvdata(pdev);
+ 
+-	if (rtc_dd->offset_dirty) {
+-		if (rtc_dd->nvmem_cell)
+-			pm8xxx_rtc_write_nvmem_offset(rtc_dd, rtc_dd->offset);
+-		else
+-			pm8xxx_rtc_write_uefi_offset(rtc_dd, rtc_dd->offset);
+-	}
++	rtc_lock(rtc_dd->rtc);
++	pm8xxx_flush_offset(rtc_dd);
++	rtc_unlock(rtc_dd->rtc);
++}
++
++static void pm8xxx_remove(struct platform_device *pdev)
++{
++	struct pm8xxx_rtc *rtc_dd = platform_get_drvdata(pdev);
++
++	rtc_lock(rtc_dd->rtc);
++	rtc_dd->rtc->ops = NULL;
++	pm8xxx_flush_offset(rtc_dd);
++	rtc_unlock(rtc_dd->rtc);
+ }
+ 
+ static struct platform_driver pm8xxx_rtc_driver = {
+ 	.probe		= pm8xxx_rtc_probe,
++	.remove		= pm8xxx_remove,
+ 	.shutdown	= pm8xxx_shutdown,
+ 	.driver	= {
+ 		.name		= "rtc-pm8xxx",
+-- 
+2.45.2

@@ -87,9 +87,15 @@ with an embedded **switch-root initramfs**) → the initramfs mounts `userdata` 
 `switch_root`s into **Arch Linux ARM / systemd** → NCM USB gadget comes up →
 `ssh root@172.16.42.1`.
 
-The DTB lives **inside the firmware** (Mu-Silicium exposes it as an EFI config
-table via `DtPlatformDxe`), so DTB changes need a re-flash; the kernel `Image`
-lives on the **ESP** and is swapped over mass-storage mode.
+Mu-Silicium exposes a baseline DTB through `DtPlatformDxe`. The RTC kernel
+loads a matching external `/EFI/BOOT/R8Q-RTC.DTB` from the ESP, allowing Linux
+device-tree updates alongside `BOOTAA64.EFI`. Deploy both files together.
+This configuration uses the native PM8150 counter and bypasses Mu's dummy
+EFI clock. The counter is protected from writes, so the driver adds a UTC
+offset stored in `RTCInfo`. `r8q-rtc.service` restores that offset from the
+Linux root filesystem before binding the driver, then saves it on shutdown.
+The initial offset must be bootstrapped from NTP-correct UTC and this phone's
+raw counter; see INSTALLATION.md and the project log.
 
 ## How the GPU works (short version)
 
