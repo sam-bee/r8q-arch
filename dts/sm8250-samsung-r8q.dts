@@ -258,6 +258,12 @@
 	};
 };
 
+&pm8150_0 {
+	rtc@6000 {
+		allow-set-time;
+	};
+};
+
 &pm8150l_gpios {
 	max77705_int_default: max77705-int-default-state {
 		pins = "gpio11";
