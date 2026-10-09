@@ -6,6 +6,7 @@
 # load /EFI/BOOT/R8Q-RTC.DTB from the ESP, without rebuilding this firmware.
 #
 # Env: MUSIL=<Mu-Silicium checkout>  DTB=<out/.../sm8250-samsung-r8q.dtb>
+# UEFI_DIAGNOSTIC=1 explicitly allows temporary discovery pages/key waits.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
@@ -22,6 +23,7 @@ DTB="$(realpath -- "$DTB")"
 VENV="$(realpath -- "$VENV")"
 PYTHON="$VENV/bin/python"
 FDT_BOOTSTRAP="$MUSIL/Resources/DTBs/r8q.dtb"
+BOOT_POLICY="$MUSIL/Common/Mu/PcBdsPkg/MsBootPolicy/MsBootPolicy.c"
 
 [[ -d "$MUSIL" ]] || die "Mu-Silicium checkout is not a directory: $MUSIL"
 [[ -f "$DTB" ]] || die "mainline DTB is missing: $DTB"
@@ -29,6 +31,11 @@ FDT_BOOTSTRAP="$MUSIL/Resources/DTBs/r8q.dtb"
 command -v "${CLANGPDB_AARCH64_PREFIX}gcc" >/dev/null || \
     die "AArch64 compiler prefix is unavailable: ${CLANGPDB_AARCH64_PREFIX}gcc"
 [[ -f "$FDT_BOOTSTRAP" ]] || die "Mu-Silicium Android bootstrap DTB is missing: $FDT_BOOTSTRAP"
+[[ -f "$BOOT_POLICY" && -r "$BOOT_POLICY" ]] || die "Mu boot policy source is missing or unreadable: $BOOT_POLICY"
+if grep -Fq 'R8Q discovery' "$BOOT_POLICY" && \
+    [[ "${UEFI_DIAGNOSTIC:-0}" != 1 ]]; then
+    die "temporary Mu discovery pages are applied; reverse the diagnostic patch for unattended boot, or set UEFI_DIAGNOSTIC=1 for a deliberate diagnostic build"
+fi
 
 BOOTSTRAP_SHA="$(sha256sum -- "$FDT_BOOTSTRAP" | awk '{print $1}')"
 DTB_SHA="$(sha256sum -- "$DTB" | awk '{print $1}')"

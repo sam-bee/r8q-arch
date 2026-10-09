@@ -212,14 +212,18 @@ sudo ip addr del 172.16.42.2/24 dev "$DEV"
 The minimal image deliberately starts with only the local USB link: phone
 `usb0` is `172.16.42.1/24`, and the laptop uses `172.16.42.2/24`. On every
 boot/reconnect, identify the fresh Samsung `r8q-mainline` / `r8q0001`
-`cdc_ncm` device and record its current interface name and MAC. The MAC can
-change between boots, so never activate a profile against an old identity.
+`cdc_ncm` device and record its current interface name and MAC. The gadget
+startup script now sets fixed locally administered addresses before binding:
+phone `4e:e0:a2:98:8c:90`, host `aa:dd:21:b3:df:6a`. Older installed versions
+generated new addresses each boot; deploy the updated script before relying
+on a persistent host MAC match.
 
 The project laptop has NetworkManager and `dnsmasq`. The saved profile
 `r8q-usb-internet` is bound to the currently verified interface and MAC,
 `ipv4.method shared`, `ipv4.never-default yes`, `ipv6.method disabled`, and
-`connection.autoconnect no`. Update its binding after each fresh USB identity,
-then activate it manually:
+`connection.autoconnect yes`. Its fixed host MAC lets NetworkManager activate
+the same profile when the phone reappears. To configure it on a freshly
+verified interface, or activate it for the first time:
 
 ```bash
 DEV=<fresh cdc_ncm interface, after USB identity verification>
@@ -228,16 +232,22 @@ MAC=<current MAC for $DEV>
 # nmcli connection add type ethernet con-name r8q-usb-internet \
 #   ifname "$DEV" 802-3-ethernet.mac-address "$MAC" \
 #   ipv4.method shared ipv4.addresses 172.16.42.2/24 \
-#   ipv4.never-default yes ipv6.method disabled connection.autoconnect no
+#   ipv4.never-default yes ipv6.method disabled connection.autoconnect yes
 nmcli connection modify r8q-usb-internet \
   connection.interface-name "$DEV" 802-3-ethernet.mac-address "$MAC" \
   ipv4.method shared ipv4.addresses 172.16.42.2/24 \
-  ipv4.never-default yes ipv6.method disabled connection.autoconnect no
+  ipv4.never-default yes ipv6.method disabled connection.autoconnect yes
 nmcli connection up r8q-usb-internet ifname "$DEV"
 ssh root@172.16.42.1 'ping -c2 172.16.42.2'
 # After the phone drop-in is reloaded, verify upstream access:
 ssh root@172.16.42.1 'ping -c2 archlinux.org'
 ```
+
+Verify both fixed MACs after a fresh phone boot, including the phone's
+`/sys/class/net/usb0/address`. Test USB enumeration and automatic SSH access
+on a restart and power-on with the cable left attached. A network profile can
+activate only after the USB device enumerates; initial attachment recovery
+needs a separate controller/gadget test.
 
 If `nmcli` or `dnsmasq` is missing on the laptop, stop and ask the operator;
 do not install a desktop dependency as part of this step. The phone-side
@@ -309,8 +319,8 @@ do not run an isolated `pacman -Sy` in this step.
 
 The older `scripts/host-tether.sh` plus full-overlay route, including
 `Gateway=172.16.42.14`, is a separate legacy flow and is not combined with
-this saved NetworkManager sharing profile. When finished, stop sharing without
-deleting the profile so it remains manual for the next verified boot:
+this saved NetworkManager sharing profile. To stop the current sharing session
+while retaining the profile for future attachment:
 
 ```bash
 nmcli connection down r8q-usb-internet

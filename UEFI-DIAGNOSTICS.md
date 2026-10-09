@@ -8,10 +8,12 @@ CACHE's attributes/range, FAT32 structures and the kernel's PE headers.
 Those checks do not establish Mu's runtime BlockIo geometry, filesystem
 publication or image loading.
 
-The patch adds console pages only to the explicit **Internal Storage** option
-(`SSD` load option). Default boot, USB Storage, FFU and Mass Storage retain
-their existing behavior. It reports published storage protocols, whole-device
-geometry, CACHE recognition, read-mode access to `\EFI\BOOT\BOOTAA64.EFI`
+The patch adds console pages to the **Internal Storage** option
+(`SSD` load option). On r8q this active option is also attempted by the normal
+boot order, so the temporary patch pauses ordinary startup for two Side/Power
+presses. Remove it after diagnosis to restore unattended boot. USB Storage,
+FFU and Mass Storage retain their existing behavior. It reports published
+storage protocols, whole-device geometry, CACHE recognition, read-mode access to `\EFI\BOOT\BOOTAA64.EFI`
 and the existing boot attempt's EFI status. CACHE identification is diagnostic
 context; the existing boot filtering and ordering remain in use.
 
@@ -31,7 +33,7 @@ test "$(git -C "$MUSIL" rev-parse HEAD)" = 07b08388a06f2322150d06607eb26f856ce11
 test "$(git -C "$MUSIL/Common/Mu" rev-parse HEAD)" = b8d46c71610318e36a661819e1e3c0b8bdda413a
 git -C "$MUSIL/Common/Mu" apply --check "$R8Q_REPO/patches/uefi/0001-msbootpolicy-r8q-discovery.patch"
 git -C "$MUSIL/Common/Mu" apply "$R8Q_REPO/patches/uefi/0001-msbootpolicy-r8q-discovery.patch"
-MUSIL="$MUSIL" DTB="$DTB" "$R8Q_REPO/scripts/build-uefi.sh"
+UEFI_DIAGNOSTIC=1 MUSIL="$MUSIL" DTB="$DTB" "$R8Q_REPO/scripts/build-uefi.sh"
 ```
 
 Before flashing, inspect the actual Android container, BootShim/FD, embedded
@@ -76,6 +78,8 @@ boot-manager behavior still applies.
 
 After collecting the results, reverse only this patch and rebuild/review the
 next candidate. Leave the separate mainline DTB embedding change in place.
+The build wrapper refuses the discovery instrumentation unless
+`UEFI_DIAGNOSTIC=1` is explicitly set.
 
 ```bash
 git -C "$MUSIL/Common/Mu" apply -R --check "$R8Q_REPO/patches/uefi/0001-msbootpolicy-r8q-discovery.patch"

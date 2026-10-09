@@ -12,6 +12,10 @@ EXPECTED_UDC_PRODUCT=0x0104
 EXPECTED_PRODUCT=r8q-mainline
 EXPECTED_MANUFACTURER=Samsung
 EXPECTED_SERIAL=r8q0001
+# Stable locally administered unicast addresses for this project's USB link.
+# Preserve the proven host identity so NetworkManager can match every boot.
+EXPECTED_DEVICE_MAC=4e:e0:a2:98:8c:90
+EXPECTED_HOST_MAC=aa:dd:21:b3:df:6a
 
 die() {
     echo "r8q-gadget: ERROR: $*" >&2
@@ -58,7 +62,8 @@ fi
 read_value() {
     [ ! -L "$1" ] || die "ConfigFS attribute is a symlink: $1"
     [ -f "$1" ] || die "missing ConfigFS attribute: $1"
-    value=$(cat "$1" 2>/dev/null) || die "cannot read ConfigFS attribute: $1"
+    # NCM address attributes include a trailing NUL on the current kernel.
+    value=$(tr -d '\000' < "$1") || die "cannot read ConfigFS attribute: $1"
     printf '%s' "$value"
 }
 
@@ -79,6 +84,8 @@ write_once "$G/strings/0x409/product" "$EXPECTED_PRODUCT"
 write_once "$G/strings/0x409/manufacturer" "$EXPECTED_MANUFACTURER"
 write_once "$G/strings/0x409/serialnumber" "$EXPECTED_SERIAL"
 write_once "$G/configs/c.1/strings/0x409/configuration" ncm
+write_once "$G/functions/ncm.usb0/dev_addr" "$EXPECTED_DEVICE_MAC"
+write_once "$G/functions/ncm.usb0/host_addr" "$EXPECTED_HOST_MAC"
 
 LINK="$G/configs/c.1/ncm.usb0"
 FUNCTION="$G/functions/ncm.usb0"
