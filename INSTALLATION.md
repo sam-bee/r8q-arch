@@ -195,25 +195,84 @@ ssh root@172.16.42.1            # password: root
 sudo ip addr del 172.16.42.2/24 dev "$DEV"
 ```
 
-## 8. USB tethering (internet + pacman)
+## 8. USB internet and clock bootstrap
 
-This and the following hardware stages are later work, after the first local
-SSH boot is verified. The minimal prepared tree has no gateway or DNS.
-Internet sharing needs a separately configured phone gateway/DNS and host NAT
-(host NAT is runtime — re-run after a PC reboot):
+The minimal image deliberately starts with only the local USB link: phone
+`usb0` is `172.16.42.1/24`, and the laptop uses `172.16.42.2/24`. On every
+boot/reconnect, identify the fresh Samsung `r8q-mainline` / `r8q0001`
+`cdc_ncm` device and record its current interface name and MAC. The MAC can
+change between boots, so never activate a profile against an old identity.
+
+The project laptop has NetworkManager and `dnsmasq`. The saved profile
+`r8q-usb-internet` is bound to the currently verified interface and MAC,
+`ipv4.method shared`, `ipv4.never-default yes`, `ipv6.method disabled`, and
+`connection.autoconnect no`. Update its binding after each fresh USB identity,
+then activate it manually:
 
 ```bash
-./scripts/host-tether.sh        # enables ip_forward + MASQUERADE for 172.16.42.0/24
+DEV=<fresh cdc_ncm interface, after USB identity verification>
+MAC=<current MAC for $DEV>
+# On a new laptop, create the profile once before the modify/up commands:
+# nmcli connection add type ethernet con-name r8q-usb-internet \
+#   ifname "$DEV" 802-3-ethernet.mac-address "$MAC" \
+#   ipv4.method shared ipv4.addresses 172.16.42.2/24 \
+#   ipv4.never-default yes ipv6.method disabled connection.autoconnect no
+nmcli connection modify r8q-usb-internet \
+  connection.interface-name "$DEV" 802-3-ethernet.mac-address "$MAC" \
+  ipv4.method shared ipv4.addresses 172.16.42.2/24 \
+  ipv4.never-default yes ipv6.method disabled connection.autoconnect no
+nmcli connection up r8q-usb-internet ifname "$DEV"
+ssh root@172.16.42.1 'ping -c2 172.16.42.2'
+# After the phone drop-in is reloaded, verify upstream access:
+ssh root@172.16.42.1 'ping -c2 archlinux.org'
 ```
 
-The full `rootfs/` overlay contains `Gateway=172.16.42.14` and DNS in
-`rootfs/etc/systemd/network/20-usb0.network`; the minimal preparation helper
-does not copy those settings. Once the phone network and host NAT are configured:
+If `nmcli` or `dnsmasq` is missing on the laptop, stop and ask the operator;
+do not install a desktop dependency as part of this step. The phone-side
+internet settings are persistent in
+`/etc/systemd/network/20-usb0.network.d/50-usb-internet.conf`:
+
+```ini
+[Network]
+DNS=172.16.42.2
+
+[Route]
+Gateway=172.16.42.2
+Metric=1000
+```
+
+After creating or changing that drop-in, run `networkctl reload` and
+`networkctl reconfigure usb0` on the phone. Preserve the existing
+`/etc/resolv.conf` symlink. Verify internet and time independently; the NTP
+service is already enabled:
 
 ```bash
-ssh root@172.16.42.1 'ping -c2 archlinux.org'
-# first pacman use on a fresh rootfs:
-ssh root@172.16.42.1 'pacman-key --init && pacman-key --populate archlinuxarm && pacman -Sy'
+busctl get-property org.freedesktop.timedate1 \
+  /org/freedesktop/timedate1 org.freedesktop.timedate1 NTPSynchronized
+timedatectl timesync-status
+timedatectl show-timesync
+test -e /run/systemd/timesync/synchronized
+stat /var/lib/systemd/timesync/clock
+curl -4 --fail --connect-timeout 5 --max-time 15 -I https://archlinuxarm.org/
+```
+
+Expect `NTPSynchronized` to return `b true`, a responding NTP server and
+nonzero packet count, and HTTPS success. Compare the phone's UTC date with the
+laptop's synchronised clock. The EFI RTC (`rtc0`) currently fails to read,
+which also breaks general `timedatectl show`; the PMIC RTC (`rtc1`) reads as
+January 1970. NTP corrects system time and saves a timestamp for later boots;
+offline time across power loss remains unverified. See the
+[systemd-timesyncd documentation](https://github.com/systemd/systemd/blob/main/man/systemd-timesyncd.service.xml).
+Future package/key bootstrap must wait for verified NTP and use a full update;
+do not run an isolated `pacman -Sy` in this step.
+
+The older `scripts/host-tether.sh` plus full-overlay route, including
+`Gateway=172.16.42.14`, is a separate legacy flow and is not combined with
+this saved NetworkManager sharing profile. When finished, stop sharing without
+deleting the profile so it remains manual for the next verified boot:
+
+```bash
+nmcli connection down r8q-usb-internet
 ```
 
 ## 9. GPU acceleration (Adreno 650) + sway
