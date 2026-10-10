@@ -511,7 +511,10 @@ systemctl daemon-reload
 **a) Modules and firmware on the phone.** Install the Wi-Fi dependency closure
 under `/lib/modules/$(uname -r)/`, with matching kernel config, exports and
 vermagic, and run `depmod -a`. Do not replace the pinned GPI/GENI modules or add
-the battery driver for this step. One dependency is easy to miss:
+the battery driver for this step. Include `crypto/sha256.ko`: RTC2 configures the
+Crypto API registration as a module even though its low-level library is built
+in. Signed regulatory-database verification needs that registration. Another
+dependency is easy to miss:
 
 ```bash
 ssh root@172.16.42.1 'ls /lib/firmware/ath11k/QCA6390/hw2.0/'   # amss.bin board-2.bin m3.bin
@@ -537,13 +540,16 @@ legacy overlay.
   this Wi-Fi unit therefore has no battery or touch dependency.
 - `etc/systemd/system/r8q-wifi.service` — requires the completed
   `r8q-usb-route.service` and checks it is active before loading, in order:
+  `sha256` (signed regulatory-database verification) →
   `phy-qcom-qmp-pcie` (the PCIe **phy is a module**; without it `1c00000.pcie`
   silently defers) → `pwrseq-qcom-wcn` → `pci-pwrctrl-pwrseq` → bounded wait for
   the discovered endpoint → `qrtr-mhi` → `ath11k_pci` → bounded wait for an
   endpoint-associated PHY. It does not assume a fixed BDF or PHY name.
 - `etc/systemd/system/NetworkManager.service.d/10-r8q-usb-route.conf` — holds
   NetworkManager behind the same route guard, so its `nl80211` probe cannot
-  autoload `cfg80211`/`rfkill` first. The blacklist includes those modules.
+  autoload `cfg80211`/`rfkill` first. It also explicitly prepares `sha256` before
+  NM can request cfg80211; both startup paths need it because they run in
+  parallel. The blacklist includes all three modules.
 - `etc/NetworkManager/conf.d/10-r8q.conf` — see (c).
 
 ```bash
@@ -596,9 +602,9 @@ nmcli device wifi connect 'YOUR-SSID' password 'YOUR-PASSPHRASE'
 
 NM stores the connection in `/etc/NetworkManager/system-connections/` for
 automatic reconnection. The current RTC2 run recovered USB automatically on one
-USB-only baseline boot and two consecutive Wi-Fi-enabled reboots. Both wireless
-boots associated, obtained DHCP, and passed Wi-Fi-bound DNS, ping and HTTPS
-checks; `usb0` remained unmanaged. Wireless key SSH passed separately.
+USB-only baseline boot and four consecutive Wi-Fi-enabled reboots, the last
+two with GPU and touch startup enabled. All wireless boots associated, obtained
+DHCP, and passed Wi-Fi-bound DNS, ping and HTTPS checks; `usb0` remained unmanaged. Wireless key SSH passed separately.
 The initial failed boot had loaded `cfg80211` before the strict USB route
 wrapper; the deployed NM gate and full alias blacklist prevent that race.
 Longer soak, power-removal and suspend remain untested.

@@ -22,6 +22,8 @@ After=r8q-usb-route.service
 Type=oneshot
 TimeoutStartSec=120
 ExecStartPre=/usr/bin/systemctl is-active --quiet r8q-usb-route.service
+# Register the modular Crypto API hash before cfg80211 verifies regulatory.db.
+ExecStartPre=/usr/bin/modprobe sha256
 ExecStart=/usr/bin/modprobe phy-qcom-qmp-pcie
 ExecStart=/usr/bin/modprobe pwrseq-qcom-wcn
 ExecStart=/usr/bin/modprobe pci-pwrctrl-pwrseq

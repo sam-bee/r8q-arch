@@ -18,12 +18,17 @@ not_contains() {
     ! grep -F "$2" "$1" >/dev/null
 }
 
+line_of() {
+    awk -v needle="$2" 'index($0, needle) { print NR; exit }' "$1"
+}
+
 sh -n "$HELPER"
 contains "$SERVICE" 'Requires=r8q-usb-route.service'
 contains "$SERVICE" 'After=r8q-usb-route.service'
 contains "$NM_DROPIN" 'Requires=r8q-usb-route.service'
 contains "$NM_DROPIN" 'After=r8q-usb-route.service'
 contains "$NM_DROPIN" 'ExecStartPre=/usr/bin/systemctl is-active --quiet r8q-usb-route.service'
+contains "$NM_DROPIN" 'ExecStartPre=/usr/bin/modprobe sha256'
 not_contains "$SERVICE" 'r8q-battery.service'
 not_contains "$SERVICE" 'r8q-touch.service'
 not_contains "$SERVICE" '0000:01:00.0'
@@ -35,11 +40,21 @@ contains "$BLACKLIST" 'blacklist qrtr_mhi'
 contains "$BLACKLIST" 'blacklist mhi'
 contains "$BLACKLIST" 'blacklist qrtr'
 contains "$BLACKLIST" 'blacklist cfg80211'
+contains "$BLACKLIST" 'blacklist sha256'
 contains "$BLACKLIST" 'blacklist rfkill'
 contains "$BLACKLIST" 'blacklist mac80211'
 contains "$BLACKLIST" 'blacklist qmi_helpers'
 contains "$BLACKLIST" 'blacklist libarc4'
 contains "$BLACKLIST" 'blacklist ath'
+
+route_pre=$(line_of "$SERVICE" 'ExecStartPre=/usr/bin/systemctl is-active --quiet r8q-usb-route.service')
+sha_pre=$(line_of "$SERVICE" 'ExecStartPre=/usr/bin/modprobe sha256')
+phy_load=$(line_of "$SERVICE" 'ExecStart=/usr/bin/modprobe phy-qcom-qmp-pcie')
+test "$route_pre" -lt "$sha_pre"
+test "$sha_pre" -lt "$phy_load"
+nm_route_pre=$(line_of "$NM_DROPIN" 'ExecStartPre=/usr/bin/systemctl is-active --quiet r8q-usb-route.service')
+nm_sha_pre=$(line_of "$NM_DROPIN" 'ExecStartPre=/usr/bin/modprobe sha256')
+test "$nm_route_pre" -lt "$nm_sha_pre"
 
 # The startup graph remains one-way: gadget -> network-pre, route -> gadget,
 # and both NM and Wi-Fi wait for route. No unit may point back to NM.

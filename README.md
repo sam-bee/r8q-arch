@@ -274,7 +274,7 @@ Two things will cost you a lot of time if you don't know them:
   mission mode and the problem is above MHI, not in the firmware.
 
 `r8q-wifi.service` loads the stack deliberately, in order, only after the
-successful `r8q-usb-route.service`: `phy-qcom-qmp-pcie` → `pwrseq-qcom-wcn` →
+successful `r8q-usb-route.service`: `sha256` → `phy-qcom-qmp-pcie` → `pwrseq-qcom-wcn` →
 `pci-pwrctrl-pwrseq` → wait for the QCA6390 endpoint → `qrtr-mhi` → `ath11k_pci`
 → wait for its associated PHY. The service has both a systemd dependency and an
 active-state precheck, so a skipped route guard cannot accidentally start Wi-Fi.
@@ -286,6 +286,13 @@ probing the `nl80211` generic-netlink family can otherwise request `cfg80211`
 and its `rfkill` dependency before the route guard. These modules are now
 blacklisted along with the rest of the wireless stack. Install this policy
 before adding the modules; do not copy the legacy full overlay wholesale.
+
+RTC2 also needs `crypto/sha256.ko` for the Crypto API used to verify the signed
+regulatory database; its low-level SHA-256 library is built in, but its API
+registration is modular. Both Wi-Fi and NetworkManager explicitly load it after
+the route guard. Its aliases are blacklisted during early boot. The original
+`regulatory.db` warning disappeared after installing this exact matching module
+and reloading the database with signature enforcement intact.
 
 The endpoint and PHY waits are dynamic and bounded. The helper accepts a PHY
 only when its sysfs device path belongs to the discovered QCA6390 PCI endpoint;
@@ -313,10 +320,11 @@ discovery responsive.
 On the current `7.1.2-r8q-rtc2` image, the first Wi-Fi-enabled boot failed
 because `cfg80211` was already loaded when the strict USB route wrapper ran.
 The exact early loader was not traced. The NetworkManager route gate and full
-Wi-Fi alias blacklist are now deployed. One USB-only baseline boot and two
-consecutive Wi-Fi-enabled reboots recovered USB automatically. Both wireless
-boots associated, obtained DHCP, and passed Wi-Fi-bound DNS, ping and HTTPS
-checks; `usb0` stayed unmanaged. Wireless key SSH passed separately.
+Wi-Fi alias blacklist are now deployed. One USB-only baseline boot and four
+consecutive Wi-Fi-enabled reboots recovered USB automatically; the last two
+also started GPU and touch services. All wireless boots associated, obtained
+DHCP, and passed Wi-Fi-bound DNS, ping and HTTPS checks; `usb0` stayed unmanaged.
+Wireless key SSH passed separately.
 Normal reboot/reconnection is validated; longer soak, power-removal and suspend
 remain untested.
 
