@@ -1,12 +1,17 @@
 [Unit]
 Description=r8q Adreno GPU: load msm (render-only, separate_gpu_kms) after display is up
 Documentation=man:modprobe(8)
-After=multi-user.target
+# The route wrapper is the only approved early module owner. Do not make this
+# a multi-user ordering edge: that creates a late boot cycle with display units.
+Requires=r8q-usb-route.service
+After=r8q-usb-route.service
 ConditionPathExists=!/dev/dri/renderD128
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/modprobe msm separate_gpu_kms=1
+TimeoutStartSec=120
+ExecStartPre=/usr/bin/systemctl is-active --quiet r8q-usb-route.service
+ExecStart=/usr/bin/modprobe msm separate_gpu_kms=1 r8q_zap_dyn=1 r8q_zap_secvid=0
 RemainAfterExit=yes
 
 [Install]

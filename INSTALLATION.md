@@ -329,57 +329,162 @@ nmcli connection down r8q-usb-internet
 ## 9. GPU acceleration (Adreno 650) + sway
 
 Prereq: the kernel was built **with the [`patches/`](patches/) applied**
-(`build_kernel.sh` does this) and its modules are installed on the rootfs —
-at minimum `msm.ko` and its dependencies under `/lib/modules/$KV/`.
+(`build_kernel.sh` does this) and its complete RTC2 module closure is installed
+on the rootfs — at minimum `msm.ko` and its DRM/Qualcomm/CEC dependencies under
+`/lib/modules/$KV/`.
 
 **a) Userspace + generic firmware** (on the phone, over SSH):
 
 ```bash
-pacman -S i2c-tools mesa vulkan-freedreno linux-firmware-qcom sway foot seatd
+pacman -S i2c-tools mesa vulkan-freedreno vulkan-tools linux-firmware-qcom sway foot grim seatd
 systemctl enable --now seatd
 ```
 
 That installs the phone-side `i2ctransfer` tool used by the guarded USB route
-service and provides `/lib/firmware/qcom/a650_sqe.fw` and `a650_gmu.bin`.
+service, provides `/lib/firmware/qcom/a650_sqe.fw` and `a650_gmu.bin`, and adds
+the tools used by the bounded render smoke test.
 
-**b) The zap shader — from YOUR device's stock firmware.** Samsung's TrustZone
-only authenticates a **Samsung-signed** zap; the generic
+**b) The zap shader — from this phone's signed APNHLOS FAT filesystem.**
+Samsung's TrustZone only authenticates a **Samsung-signed** zap; the generic
 `qcom/sm8250/a650_zap.mbn` from linux-firmware is rejected (`-22`) and the GPU
-then silently drops every render write. Get the stock firmware for your model
-(e.g. the AP tarball from samfw/frija), pull `a650_zap.mdt` + `a650_zap.b00/.b01/.b02`
-out of the `vendor` image (`/vendor/firmware/`), and install them as:
+then silently drops every render write. For the verified SM-G7810 TGY HZE1
+stock, the source is the phone's APNHLOS filesystem (label `apnhlos`), not
+`SUPER`, `vendor`, or the separate MODEM filesystem. The local HZE1 provenance
+is `s20-backup/stock-HZE1/heimdall-hze1/NON-HLOS.bin`, whose
+108294656-byte prefix has SHA-256
+`40f5e2f7a8b8ae6158c267650908af6fd9f5e84a9ea34099720613e983a6518f`.
 
+Do not assume a partition number on another phone. Resolve the live device by
+its partition label, verify the model and FAT type, and compare the HZE1 prefix
+hash before reading files. Mount it read-only:
+
+```bash
+tr -d '\0' < /proc/device-tree/model; echo
+lsblk -o NAME,PATH,SIZE,TYPE,PARTLABEL,FSTYPE,MOUNTPOINTS
+APNHLOS=$(readlink -f /dev/disk/by-partlabel/apnhlos)
+lsblk -n -o PARTLABEL "$APNHLOS"          # want apnhlos
+blkid "$APNHLOS"                         # want TYPE="vfat"
+head -c 108294656 "$APNHLOS" | sha256sum  # want the HZE1 prefix hash above
+mkdir -p /mnt/apnhlos
+mount -o ro,nodev,nosuid,noexec "$APNHLOS" /mnt/apnhlos
+find /mnt/apnhlos -type f -iname 'a650_zap.*' -print
 ```
+
+The verified extraction contained the MDT and the three segments actually
+present in that FAT directory. Preserve these exact four files and do not
+guess a different segment count:
+
+| Stock file | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `a650_zap.mdt` | 6860 | `56e59374363696bac7bef2b89efc2d3d9cbb78474b4e3ef0111ebd786274d67d` |
+| `a650_zap.b00` | 148 | `ec9b9d5a67456384809624b14a00d15d36297e5f2e75728504cd872bc95e0947` |
+| `a650_zap.b01` | 6712 | `426cf7e5bcaf2308e0602440055486c7171b1eb340a8d76a43690dbe43dcf752` |
+| `a650_zap.b02` | 1676 | `a415e5452fa8f597670a6e51010e97bfabca7d20fbce8044caed64d9d5873113` |
+
+Install the MDT under the filename requested by the kernel, while retaining
+the sibling names:
+
+```text
 /lib/firmware/qcom/sm8250/a650_zap.mbn    <- the stock a650_zap.mdt, renamed
 /lib/firmware/qcom/sm8250/a650_zap.b00
 /lib/firmware/qcom/sm8250/a650_zap.b01
 /lib/firmware/qcom/sm8250/a650_zap.b02
 ```
 
-**c) Module options + post-boot load.** The [`rootfs/`](rootfs/) overlay ships
-these (already in place if you re-ran the overlay):
+Copy the four files from the path printed by `find`, then unmount the source:
 
-- `etc/modprobe.d/r8q-gpu.conf` — `blacklist msm` **plus**
+```bash
+umount /mnt/apnhlos
+```
+
+**c) Ordered driver startup.** Install the exact RTC2 module closure separately.
+The [`rootfs/`](rootfs/) overlay supplies these load controls:
+
+- `etc/modprobe.d/r8q-gpu.conf` — blacklists `msm` and its DRM/Qualcomm
+  dependency aliases so udev cannot coldplug a partial closure, plus
   `options msm separate_gpu_kms=1 r8q_zap_dyn=1 r8q_zap_secvid=0`.
   `r8q_zap_dyn=1` is **required**: it loads the zap into dynamically allocated
   RAM; pointing it at the DT carveout makes Samsung's TZ **hard-reset the SoC**.
-- `etc/systemd/system/r8q-gpu.service` — loads `msm` after `multi-user.target`
-  (never let udev coldplug it). `systemctl enable r8q-gpu.service`.
+- `etc/systemd/system/r8q-gpu.service` — has `Requires=` and `After=` on the
+  USB route service and an active-state `ExecStartPre` guard, then explicitly
+  loads `msm` with the three required parameters. Do not add an
+  `After=multi-user.target` edge; that creates a display/startup cycle.
 - `root/.bash_profile` — tty1 autologin waits for `renderD128`, then starts
   **sway** with the vulkan (turnip) renderer: render node `renderD128`,
   scanout on simpledrm `card0`.
 
-**d) Verify** (after a reboot):
+Start the service manually for the first validation boot. Enable it for future
+boots only after the rendering smoke test below passes:
 
 ```bash
-ssh root@172.16.42.1 'ls /dev/dri; dmesg | grep -i zap'
-# want: renderD128 present, "r8q: zap region dma_alloc'd at ..." and NO "zap auth failed"
+systemctl start r8q-gpu.service
 ```
 
-Sway should be on the panel. Rules of the road: **never `rmmod msm`** (GMU/IOMMU
-teardown wedges the kernel — load once per boot), and never write the SECVID
-registers from the kernel (the hypervisor traps them; that is what
-`r8q_zap_secvid=0` keeps disabled).
+**d) Verify actual hardware rendering before enabling the service.** A render
+node or `vulkaninfo` alone is not proof: require a compositor to submit a real
+Wayland client surface and capture the resulting image. From a user session
+(UID 1000), run a short headless Sway smoke test using the Adreno render node:
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/1000
+unset WAYLAND_DISPLAY DISPLAY
+export WLR_BACKENDS=headless
+export WLR_HEADLESS_OUTPUTS=1
+export WLR_RENDERER=vulkan
+export WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
+export LIBSEAT_BACKEND=seatd
+sway -d 2>/tmp/r8q-sway-gpu-smoke.log
+```
+
+Sway chooses its own Wayland socket. In another shell for the same user, set
+`XDG_RUNTIME_DIR` to the same directory and `WAYLAND_DISPLAY` to the socket
+reported by `Running compositor on wayland display` in that Sway log. Then
+create a client surface and capture it:
+
+```bash
+foot --title r8q-gpu-smoke sh -c \
+  'printf "R8Q Adreno 650 GPU surface\n"; sleep 20' &
+sleep 2
+grim -t png /tmp/r8q-gpu-smoke.png
+file /tmp/r8q-gpu-smoke.png
+grep -Ei 'vulkan|turnip|FD650|Adreno|renderD128|llvmpipe|softpipe|pixman|software|failed|error' \
+  /tmp/r8q-sway-gpu-smoke.log
+```
+
+Pass requires Sway to report the Turnip/Adreno 650 renderer on `renderD128`,
+no software renderer or zap-auth failure, and `grim` to produce a valid PNG
+containing the client surface. After this headless proof, a separate DRM-mode
+session may validate the split pairing by setting
+`WLR_BACKENDS=drm,libinput`, `WLR_DRM_DEVICES=/dev/dri/card0`, and retaining
+`WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128`; this is the panel check and is
+not implied by the headless result.
+
+The bounded panel smoke test has passed on the current phone: the DRM backend
+selected simpledrm at 1080x2400 on `DSI-1` for scanout, Turnip used the Adreno
+render node, and real `foot` plus Vulkan-cube client surfaces were captured as
+PNG files and visually checked. `vkcube` completed 1800 frames with exit status
+0. This establishes the split rendering path for the tested run; it is not a
+long-soak result. After a reboot with GPU/touch startup enabled, the render
+smoke test passed again and Sway's libinput backend recognized the Zinitix
+touchscreen with events enabled. Physical tap coordinates remain untested.
+`vulkaninfo --summary` currently fails while querying `VK_KHR_display`; the
+Sway/Turnip and Vulkan-cube rendering tests succeed despite that display-query
+failure. GPU and touch services now start automatically after USB recovery.
+
+Only after the proof succeeds:
+
+```bash
+systemctl enable r8q-gpu.service
+```
+
+```bash
+ssh root@172.16.42.1 'ls /dev/dri; dmesg | grep -Ei "zap|adreno|render"'
+```
+
+Do not claim panel success from the headless test. Rules of the road: **never
+`rmmod msm`** (GMU/IOMMU teardown wedges the kernel — load once per boot), and
+never write the SECVID registers from the kernel (the hypervisor traps them;
+that is what `r8q_zap_secvid=0` keeps disabled).
 
 ## 10. Wi-Fi (QCA6390 over PCIe)
 
@@ -490,14 +595,13 @@ nmcli device wifi connect 'YOUR-SSID' password 'YOUR-PASSPHRASE'
 ```
 
 NM stores the connection in `/etc/NetworkManager/system-connections/` for
-automatic reconnection. The validated RTC2 run associated and
-received `192.168.178.98`; wireless DNS, HTTPS, and ping passed after the USB
-default gateway was temporarily removed, while `usb0` remained unmanaged.
-The first reboot with Wi-Fi enabled did not restore either USB or wireless
-access. The NetworkManager gate and expanded blacklist were prepared after
-that failure and remain undeployed; offline validation cannot identify the
-runtime cause. Recover the boot logs and repeat reboot/reconnection checks
-before treating the path as fully proven.
+automatic reconnection. The current RTC2 run recovered USB automatically on one
+USB-only baseline boot and two consecutive Wi-Fi-enabled reboots. Both wireless
+boots associated, obtained DHCP, and passed Wi-Fi-bound DNS, ping and HTTPS
+checks; `usb0` remained unmanaged. Wireless key SSH passed separately.
+The initial failed boot had loaded `cfg80211` before the strict USB route
+wrapper; the deployed NM gate and full alias blacklist prevent that race.
+Longer soak, power-removal and suspend remain untested.
 
 **Debugging note.** If MHI ever stalls again, build `mhi.ko` with
 `CONFIG_MHI_BUS_DEBUG=y` and read `/sys/kernel/debug/mhi/*/regdump`. It prints
@@ -626,14 +730,14 @@ GNOME stays installed; revert with `systemctl disable sddm && systemctl enable g
 `/usr/lib/firmware/qcom/sm8250/a650_zap.mbn` is **owned by `linux-firmware-qcom`**,
 and step 9 overwrote it with your Samsung-signed blob. Any upgrade of that package
 silently restores the upstream file and the GPU then hangs on its first submit. Add
-this to `/etc/pacman.conf` once:
+this in the `[options]` section of `/etc/pacman.conf` once:
 
 ```
-NoUpgrade = usr/lib/firmware/qcom/sm8250/a650_zap.mbn
+NoUpgrade = usr/lib/firmware/qcom/sm8250/a650_zap.mbn usr/lib/firmware/qcom/sm8250/a650_zap.b00 usr/lib/firmware/qcom/sm8250/a650_zap.b01 usr/lib/firmware/qcom/sm8250/a650_zap.b02
 ```
 
 pacman will drop the upstream file as `.pacnew` instead. Verify at any time with
-`md5sum /usr/lib/firmware/qcom/sm8250/a650_zap.mbn` against your saved copy.
+`sha256sum /usr/lib/firmware/qcom/sm8250/a650_zap.*` against your saved copy.
 
 Two more things that bite on a fresh ALARM rootfs:
 

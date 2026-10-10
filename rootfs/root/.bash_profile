@@ -1,6 +1,6 @@
 [ -f ~/.bashrc ] && . ~/.bashrc
 # Auto-start sway on the tty1 autologin VT (guarded so ssh sessions are unaffected).
-# r8q-gpu.service loads msm after multi-user, so wait briefly for the render node;
+# r8q-gpu.service loads msm after USB routing, so wait briefly for the render node;
 # if it never appears, stay at a shell (an instantly-dying exec sway crash-loops getty).
 if [ -z "$WAYLAND_DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
     for i in $(seq 1 30); do [ -e /dev/dri/renderD128 ] && break; sleep 1; done

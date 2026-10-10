@@ -310,15 +310,15 @@ calibration data, so ath11k has no reliable stored hardware address.
 Power saving is disabled during bring-up to keep incoming SSH and neighbor
 discovery responsive.
 
-On the current `7.1.2-r8q-rtc2` image, QCA6390 association and DHCP succeeded
-(`192.168.178.98`), and wireless DNS, HTTPS, and ping were verified with the USB
-default gateway temporarily removed. `usb0` remained unmanaged throughout.
-That validates the independent wireless path; reboot/reconnect soak remains a
-separate check. The first reboot with Wi-Fi enabled did **not** restore USB or
-wireless access. The NetworkManager startup gate and expanded blacklist above
-were prepared afterward and have passed offline checks, but remain undeployed.
-An early-module race and an ath11k/MHI shutdown stall are hypotheses until the
-phone's boot logs can be recovered. Automatic reconnection is not yet proven.
+On the current `7.1.2-r8q-rtc2` image, the first Wi-Fi-enabled boot failed
+because `cfg80211` was already loaded when the strict USB route wrapper ran.
+The exact early loader was not traced. The NetworkManager route gate and full
+Wi-Fi alias blacklist are now deployed. One USB-only baseline boot and two
+consecutive Wi-Fi-enabled reboots recovered USB automatically. Both wireless
+boots associated, obtained DHCP, and passed Wi-Fi-bound DNS, ping and HTTPS
+checks; `usb0` stayed unmanaged. Wireless key SSH passed separately.
+Normal reboot/reconnection is validated; longer soak, power-removal and suspend
+remain untested.
 
 Two things worth knowing about the log noise Wi-Fi produces:
 
