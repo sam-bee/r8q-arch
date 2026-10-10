@@ -1,0 +1,1640 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: r8q audio integration <offline-build>
+Date: Sat, 10 Oct 2026 00:00:00 +0100
+Subject: [PATCH] ASoC: codecs: add r8q CS35L41 runtime behavior
+
+This is a canonical standalone source patch for the exact Linux 7.1.2
+r8q-rtc2 source. It contains no firmware or factory calibration payload.
+---
+--- a/sound/soc/codecs/cs35l41.c
++++ b/sound/soc/codecs/cs35l41.c
+@@ -14,8 +14,10 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
++#include <linux/of.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/property.h>
++#include <linux/unaligned.h>
+ #include <sound/initval.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+@@ -181,12 +183,27 @@
+ 			    CS35L41_AMP_DIG_VOL_CTRL, 0,
+ 			    cs35l41_pcm_sftramp_text);
+ 
++static int cs35l41_r8q_force_mute(struct cs35l41_private *cs35l41);
++static int cs35l41_r8q_apply_factory_cal(struct cs35l41_private *cs35l41);
++static int cs35l41_r8q_cspl_cmd(struct cs35l41_private *cs35l41,
++				enum cs35l41_cspl_mbox_cmd cmd);
++
++/* The latch is protected by r8q_cspl_lock; callers holding audio_lock take
++ * this lock in the audio -> CSPL order.  The mailbox helper updates it while
++ * already holding CSPL, so it must not call this helper recursively. */
++static void cs35l41_r8q_clear_resume_latch(struct cs35l41_private *cs35l41)
++{
++	mutex_lock(&cs35l41->r8q_cspl_lock);
++	cs35l41->r8q_resume_acked = false;
++	mutex_unlock(&cs35l41->r8q_cspl_lock);
++}
++
+ static int cs35l41_dsp_preload_ev(struct snd_soc_dapm_widget *w,
+ 				  struct snd_kcontrol *kcontrol, int event)
+ {
+ 	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+ 	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(component);
+-	int ret;
++	int ret, mute_ret;
+ 
+ 	switch (event) {
+ 	case SND_SOC_DAPM_PRE_PMU:
+@@ -194,9 +211,49 @@
+ 			return 0;
+ 
+ 		return wm_adsp_early_event(w, kcontrol, event);
++	case SND_SOC_DAPM_POST_PMU:
++		/*
++		 * Samsung powers the preloader before the route and output widgets:
++		 * load HALO, then apply factory calibration while the analog mute is
++		 * still asserted.  This avoids the DSP-route/calibration DAPM cycle.
++		 */
++		if (!cs35l41->r8q_audio_path)
++			return 0;
++
++		if (!cs35l41->dsp.cs_dsp.running) {
++			ret = wm_adsp_event(w, kcontrol, event);
++			if (ret) {
++				if (cs35l41->r8q_audio_path) {
++					cs35l41_r8q_clear_resume_latch(cs35l41);
++					mute_ret = cs35l41_r8q_force_mute(cs35l41);
++					if (ret >= 0 && mute_ret < 0)
++						ret = mute_ret;
++				}
++				return ret;
++			}
++		}
++
++		if (!cs35l41->dsp.cs_dsp.running) {
++			cs35l41_r8q_clear_resume_latch(cs35l41);
++			cs35l41_r8q_force_mute(cs35l41);
++			return -EAGAIN;
++		}
++
++		return cs35l41_r8q_apply_factory_cal(cs35l41);
+ 	case SND_SOC_DAPM_PRE_PMD:
+ 		if (cs35l41->dsp.preloaded)
+ 			return 0;
++
++		if (cs35l41->r8q_audio_path) {
++			/* This path really powers down XMEM; invalidate only after mute. */
++			mutex_lock(&cs35l41->r8q_audio_lock);
++			ret = cs35l41_r8q_force_mute(cs35l41);
++			cs35l41->r8q_calibration_applied = false;
++			cs35l41_r8q_clear_resume_latch(cs35l41);
++			mutex_unlock(&cs35l41->r8q_audio_lock);
++			if (ret)
++				return ret;
++		}
+ 
+ 		if (cs35l41->dsp.cs_dsp.running) {
+ 			ret = wm_adsp_event(w, kcontrol, event);
+@@ -220,13 +277,53 @@
+ 
+ 	switch (event) {
+ 	case SND_SOC_DAPM_POST_PMU:
+-		if (!cs35l41->dsp.cs_dsp.running)
+-			return wm_adsp_event(w, kcontrol, event);
++		if (!cs35l41->dsp.cs_dsp.running) {
++			ret = wm_adsp_event(w, kcontrol, event);
++			if (ret) {
++				if (cs35l41->r8q_audio_path) {
++					cs35l41_r8q_clear_resume_latch(cs35l41);
++					cs35l41_r8q_force_mute(cs35l41);
++				}
++				return ret;
++			}
++
++			if (cs35l41->r8q_audio_path) {
++				if (!cs35l41->dsp.cs_dsp.running) {
++					ret = -EAGAIN;
++					cs35l41_r8q_clear_resume_latch(cs35l41);
++					cs35l41_r8q_force_mute(cs35l41);
++					return ret;
++				}
++
++				ret = cs35l41_r8q_apply_factory_cal(cs35l41);
++				if (ret)
++					return ret;
++			} else {
++				return 0;
++			}
++		} else if (cs35l41->r8q_audio_path &&
++				   !cs35l41->r8q_calibration_applied) {
++			ret = cs35l41_r8q_apply_factory_cal(cs35l41);
++			if (ret)
++				return ret;
++		}
++
++		if (cs35l41->r8q_audio_path &&
++			(!cs35l41->dsp.cs_dsp.running ||
++			 !cs35l41->r8q_calibration_applied)) {
++			cs35l41_r8q_clear_resume_latch(cs35l41);
++			cs35l41_r8q_force_mute(cs35l41);
++			return -EAGAIN;
++		}
+ 
+ 		ret = regmap_read(cs35l41->regmap, CS35L41_DSP_MBOX_2, &fw_status);
+ 		if (ret < 0) {
+ 			dev_err(cs35l41->dev,
+ 				"Failed to read firmware status: %d\n", ret);
++			if (cs35l41->r8q_audio_path) {
++				cs35l41_r8q_clear_resume_latch(cs35l41);
++				cs35l41_r8q_force_mute(cs35l41);
++			}
+ 			return ret;
+ 		}
+ 
+@@ -237,14 +334,37 @@
+ 		default:
+ 			dev_err(cs35l41->dev, "Firmware status is invalid: %u\n",
+ 				fw_status);
++			if (cs35l41->r8q_audio_path) {
++				cs35l41_r8q_clear_resume_latch(cs35l41);
++				cs35l41_r8q_force_mute(cs35l41);
++			}
+ 			return -EINVAL;
+ 		}
+ 
+-		return cs35l41_set_cspl_mbox_cmd(cs35l41->dev, cs35l41->regmap,
+-						 CSPL_MBOX_CMD_RESUME);
++		/* R8Q output is protected by the DSP PCM path; reject ASP bypass. */
++		if (cs35l41->r8q_audio_path && !cs35l41->r8q_halo_routed) {
++			cs35l41_r8q_clear_resume_latch(cs35l41);
++			cs35l41_r8q_force_mute(cs35l41);
++			return -EAGAIN;
++		}
++
++		/* R8Q submits RESUME from Main AMP POST_PMU, after GLOBAL_EN. */
++		if (cs35l41->r8q_audio_path)
++			return 0;
++
++		ret = cs35l41_r8q_cspl_cmd(cs35l41, CSPL_MBOX_CMD_RESUME);
++		if (ret && cs35l41->r8q_audio_path)
++			cs35l41_r8q_force_mute(cs35l41);
++		return ret;
+ 	case SND_SOC_DAPM_PRE_PMD:
+-		return cs35l41_set_cspl_mbox_cmd(cs35l41->dev, cs35l41->regmap,
+-						 CSPL_MBOX_CMD_PAUSE);
++		/* R8Q submits PAUSE from Main AMP POST_PMD, before GLOBAL_EN clears. */
++		if (cs35l41->r8q_audio_path)
++			return 0;
++
++		ret = cs35l41_r8q_cspl_cmd(cs35l41, CSPL_MBOX_CMD_PAUSE);
++		if (ret && cs35l41->r8q_audio_path)
++			cs35l41_r8q_force_mute(cs35l41);
++		return ret;
+ 	default:
+ 		return 0;
+ 	}
+@@ -261,6 +381,722 @@
+ static const struct snd_kcontrol_new pcm_source_mux =
+ 	SOC_DAPM_ENUM("PCM Source", cs35l41_pcm_source_enum);
+ 
++static bool cs35l41_r8q_dsp_source(unsigned int source)
++{
++	return source == CS35L41_INPUT_DSP_TX1 ||
++		source == CS35L41_INPUT_DSP_TX2;
++}
++
++static bool cs35l41_r8q_asp_source(unsigned int source)
++{
++	return source == CS35L41_INPUT_SRC_ASPRX1 ||
++		source == CS35L41_INPUT_SRC_ASPRX2;
++}
++
++/* Keep the hardware muted when a mailbox, source, or register operation fails. */
++static int cs35l41_r8q_force_mute(struct cs35l41_private *cs35l41)
++{
++	int ret;
++
++	ret = regmap_update_bits(cs35l41->regmap, CS35L41_AMP_OUT_MUTE,
++		CS35L41_AMP_MUTE_MASK << CS35L41_AMP_MUTE_SHIFT,
++		CS35L41_AMP_MUTE_MASK << CS35L41_AMP_MUTE_SHIFT);
++	if (ret >= 0) {
++		cs35l41->r8q_output_muted = true;
++		ret = 0;
++	}
++
++	return ret;
++}
++
++static void cs35l41_r8q_first_error(int *first, int ret)
++{
++	/* regmap_update_bits() returns 1 when it changed a field; only <0 fails. */
++	if (!*first && ret < 0)
++		*first = ret;
++}
++
++#define CS35L41_R8Q_CSPL_MBOX_DRV_SHIFT 20
++#define CS35L41_R8Q_CSPL_MBOX_FW_SHIFT  21
++
++static bool cs35l41_r8q_cspl_status_ok(enum cs35l41_cspl_mbox_cmd cmd,
++					       unsigned int status)
++{
++	switch (cmd) {
++	case CSPL_MBOX_CMD_PAUSE:
++		return status == CSPL_MBOX_STS_PAUSED;
++	case CSPL_MBOX_CMD_RESUME:
++		return status == CSPL_MBOX_STS_RUNNING;
++	default:
++		return false;
++	}
++}
++
++/*
++ * Protection v0.0.1 acknowledges PAUSE/RESUME through its IRQ mailbox.  The
++ * upstream helper only writes VIRT1_MBOX_1 and polls DSP_MBOX_2; that leaves
++ * this image at status 0 after PAUSE.  Keep this transaction board-local and
++ * serialized: source-switch DAPM already holds r8q_audio_lock, so using a
++ * separate mutex also prevents a concurrent DAPM callback without nesting
++ * that lock.  The host IRQ is shared, but these status bits are per-device.
++ */
++static int cs35l41_r8q_set_cspl_mbox_cmd(struct cs35l41_private *cs35l41,
++					 enum cs35l41_cspl_mbox_cmd cmd)
++{
++	unsigned int status = CSPL_MBOX_STS_ERROR;
++	unsigned int i;
++	unsigned int drv_bit = 1U << CS35L41_R8Q_CSPL_MBOX_DRV_SHIFT;
++	unsigned int fw_bit = 1U << CS35L41_R8Q_CSPL_MBOX_FW_SHIFT;
++	int ret = 0;
++	int tmp;
++	bool ack = false;
++	bool drv_unmasked = false;
++	bool state_ok = false;
++
++	if (cmd != CSPL_MBOX_CMD_PAUSE && cmd != CSPL_MBOX_CMD_RESUME)
++		return -EINVAL;
++
++	mutex_lock(&cs35l41->r8q_cspl_lock);
++	/* A new transaction must not inherit a previous successful RESUME. */
++	cs35l41->r8q_resume_acked = false;
++
++	/* Clear stale driver and firmware sticky bits before each command. */
++	tmp = regmap_write(cs35l41->regmap, CS35L41_IRQ2_STATUS2, drv_bit);
++	if (tmp < 0) {
++		ret = tmp;
++		goto out;
++	}
++	tmp = regmap_write(cs35l41->regmap, CS35L41_IRQ1_STATUS2, fw_bit);
++	if (tmp < 0) {
++		ret = tmp;
++		goto out;
++	}
++
++	/* Unmask the driver mailbox, then submit the command. */
++	tmp = regmap_update_bits(cs35l41->regmap, CS35L41_IRQ2_MASK2,
++				 drv_bit, 0);
++	if (tmp < 0) {
++		ret = tmp;
++		goto out;
++	}
++	drv_unmasked = true;
++	tmp = regmap_write(cs35l41->regmap, CS35L41_DSP_VIRT1_MBOX_1, cmd);
++	if (tmp < 0) {
++		ret = tmp;
++		goto mask;
++	}
++
++	/* Samsung firmware raises the AP mailbox ACK within 15 ms. */
++	for (i = 0; i < 15; i++) {
++		usleep_range(1000, 1010);
++		tmp = regmap_read(cs35l41->regmap, CS35L41_IRQ1_STATUS2,
++				   &status);
++		if (tmp < 0)
++			continue;
++		if (status & fw_bit) {
++			tmp = regmap_write(cs35l41->regmap, CS35L41_IRQ1_STATUS2,
++					   fw_bit);
++			if (tmp < 0)
++				ret = tmp;
++			else
++				ack = true;
++			break;
++		}
++	}
++	if (!ack && !ret)
++		ret = -ETIMEDOUT;
++
++mask:
++	if (drv_unmasked) {
++		tmp = regmap_update_bits(cs35l41->regmap, CS35L41_IRQ2_MASK2,
++					 drv_bit, drv_bit);
++		if (tmp < 0 && !ret)
++			ret = tmp;
++	}
++
++	/* Verify the firmware's resulting CSPL state after masking its IRQ. */
++	tmp = regmap_read(cs35l41->regmap, CS35L41_DSP_MBOX_2, &status);
++	if (tmp < 0) {
++		if (!ret)
++			ret = -EACCES;
++	} else if (!cs35l41_r8q_cspl_status_ok(cmd, status) && !ret) {
++		dev_err(cs35l41->dev,
++			"R8Q CSPL mailbox state mismatch (cmd %u, status %u)\n",
++			cmd, status);
++		ret = -ENOMSG;
++	} else if (!ret) {
++		state_ok = true;
++	}
++
++out:
++	/* Only an ACK followed by a RUNNING readback authorizes unmute. */
++	if (cmd == CSPL_MBOX_CMD_RESUME && !ret && state_ok &&
++		cs35l41->dsp.cs_dsp.running)
++		cs35l41->r8q_resume_acked = true;
++	else
++		cs35l41->r8q_resume_acked = false;
++	mutex_unlock(&cs35l41->r8q_cspl_lock);
++	return ret;
++}
++
++/* Use the Samsung IRQ handshake only for the protected R8Q path. */
++static int cs35l41_r8q_cspl_cmd(struct cs35l41_private *cs35l41,
++				enum cs35l41_cspl_mbox_cmd cmd)
++{
++	if (!cs35l41->dsp.cs_dsp.running) {
++		if (cs35l41->r8q_audio_path)
++			cs35l41_r8q_clear_resume_latch(cs35l41);
++		return 0;
++	}
++
++	if (cs35l41->r8q_audio_path)
++		return cs35l41_r8q_set_cspl_mbox_cmd(cs35l41, cmd);
++
++	return cs35l41_set_cspl_mbox_cmd(cs35l41->dev, cs35l41->regmap, cmd);
++}
++
++/* The vendor digital_mute path uses CSPL_COMMAND MUTE/UNMUTE directly. */
++static int cs35l41_r8q_cspl_direct_mute(struct cs35l41_private *cs35l41,
++						bool mute)
++{
++	int ret;
++
++	if (!cs35l41->dsp.cs_dsp.running)
++		return 0;
++
++	mutex_lock(&cs35l41->r8q_cspl_lock);
++	ret = regmap_write(cs35l41->regmap, CS35L41_R8Q_CSPL_COMMAND,
++				   mute ? CS35L41_R8Q_CSPL_CMD_MUTE :
++				   CS35L41_R8Q_CSPL_CMD_UNMUTE);
++	mutex_unlock(&cs35l41->r8q_cspl_lock);
++
++	return ret;
++}
++
++/*
++ * Keep the SOC_SINGLE_SX conversion local so the ALSA value remains stable
++ * while the hardware field is occupied by the vendor mute sentinel.  The
++ * private value below is SOC_SINGLE_VALUE(reg, shift, 0x4cf, 0x391, 0, 0),
++ * therefore soc_mixer_sx_mask() is GENMASK(10, 0).
++ */
++static unsigned int cs35l41_r8q_volume_ctl_to_reg(unsigned int value)
++{
++	return (value + CS35L41_AMP_VOL_PCM_MUTE) &
++		CS35L41_AMP_VOL_PCM_MASK;
++}
++
++static unsigned int cs35l41_r8q_volume_reg_to_ctl(unsigned int value)
++{
++	int ctl;
++
++	ctl = (value & CS35L41_AMP_VOL_PCM_MASK) -
++		CS35L41_AMP_VOL_PCM_MUTE;
++
++	return min_t(unsigned int, ctl & CS35L41_AMP_VOL_PCM_MASK, 0x391);
++}
++
++/* Samsung's A0 HALO image requires 16-bit test-key words for cap-trim. */
++static int cs35l41_r8q_cap_key_unlock(struct cs35l41_private *cs35l41)
++{
++	static const struct reg_sequence key[] = {
++		{ CS35L41_TEST_KEY_CTL, 0x00005555 },
++		{ CS35L41_TEST_KEY_CTL, 0x0000AAAA },
++	};
++
++	return regmap_multi_reg_write(cs35l41->regmap, key, ARRAY_SIZE(key));
++}
++
++static int cs35l41_r8q_cap_key_lock(struct cs35l41_private *cs35l41)
++{
++	static const struct reg_sequence key[] = {
++		{ CS35L41_TEST_KEY_CTL, 0x0000CCCC },
++		{ CS35L41_TEST_KEY_CTL, 0x00003333 },
++	};
++
++	return regmap_multi_reg_write(cs35l41->regmap, key, ARRAY_SIZE(key));
++}
++
++/* Match Samsung's soft-ramp wait before issuing direct CSPL MUTE. */
++static int cs35l41_r8q_mute_ramp_delay(struct cs35l41_private *cs35l41)
++{
++	static const unsigned int ramp_conv_table[] = { 0, 1, 2, 4, 8, 16, 30, 60 };
++	unsigned int ramp, status;
++	int ramp_ms, ret;
++
++	ret = regmap_read(cs35l41->regmap, CS35L41_AMP_DIG_VOL_CTRL, &ramp);
++	if (ret)
++		return ret;
++	ramp &= CS35L41_R8Q_AMP_VOL_RAMP_MASK;
++
++	ret = regmap_read(cs35l41->regmap, CS35L41_IRQ1_STATUS2, &status);
++	if (ret)
++		return ret;
++
++	/* The vendor path skips the sleep when both AUX noise gates are active. */
++	if ((status & CS35L41_R8Q_AUX_NG_CH1_ENTRY_MASK) &&
++		(status & CS35L41_R8Q_AUX_NG_CH2_ENTRY_MASK) &&
++		cs35l41->dsp.cs_dsp.running && cs35l41->r8q_halo_routed)
++		return 0;
++
++	if (ramp >= ARRAY_SIZE(ramp_conv_table))
++		return -EINVAL;
++
++	ramp_ms = ramp_conv_table[ramp] * CS35L41_R8Q_AMP_VOL_MIN / 12;
++	if (ramp_ms < 20)
++		usleep_range(ramp_ms * 1000, ramp_ms * 1000 + 100);
++	else
++		msleep(ramp_ms);
++
++	return 0;
++}
++
++#define CS35L41_R8Q_FACTORY_CAL_SIZE	24
++#define CS35L41_R8Q_FACTORY_CAL_VERSION	1
++
++static bool cs35l41_r8q_vimon_value_valid(u32 value, u32 upper,
++						u32 lower)
++{
++	/* The vendor test accepts the low signed range or the high 24-bit range. */
++	return value <= upper || (value >= lower && value <= 0x00FFFFFF);
++}
++
++static int cs35l41_r8q_cal_firmware_name(struct cs35l41_private *cs35l41,
++					 char *name, size_t name_len)
++{
++	const char *part = cs35l41->r8q_dsp_part_name ?: "";
++	int ret;
++
++	if (!strcmp(part, "cs35l40-bot"))
++		ret = scnprintf(name, name_len, "r8q/cs35l40-bot-factory.cal");
++	else if (!strcmp(part, "cs35l40-rcv"))
++		ret = scnprintf(name, name_len, "r8q/cs35l40-rcv-factory.cal");
++	else
++		return -EINVAL;
++
++	return ret < name_len ? 0 : -ENAMETOOLONG;
++}
++
++static int cs35l41_r8q_cal_write_verify(struct cs35l41_private *cs35l41,
++					unsigned int reg, unsigned int value)
++{
++	unsigned int readback;
++	int ret;
++
++	ret = regmap_write(cs35l41->regmap, reg, value);
++	if (ret)
++		return ret;
++
++	ret = regmap_read(cs35l41->regmap, reg, &readback);
++	if (ret)
++		return ret;
++
++	if (readback != value) {
++		dev_err(cs35l41->dev,
++			"R8Q factory calibration readback 0x%x: wrote 0x%x, got 0x%x\n",
++			reg, value, readback);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++/*
++ * Apply the per-device factory values used by Samsung's cirrus_cal_apply().
++ * The producer of these files is outside the kernel and must obtain values
++ * from the preserved EFS.  No calibration value is compiled into the driver.
++ */
++static int cs35l41_r8q_apply_factory_cal(struct cs35l41_private *cs35l41)
++{
++	const struct firmware *fw = NULL;
++	char name[64];
++	const u8 *data;
++	u32 rdc, ambient, vsc, isc;
++	int ret, mute_ret;
++
++	if (!cs35l41->r8q_audio_path)
++		return 0;
++
++	mutex_lock(&cs35l41->r8q_audio_lock);
++	cs35l41->r8q_calibration_applied = false;
++	cs35l41_r8q_clear_resume_latch(cs35l41);
++
++	ret = cs35l41_r8q_cal_firmware_name(cs35l41, name, sizeof(name));
++	if (ret)
++		goto fail;
++
++	ret = request_firmware(&fw, name, cs35l41->dev);
++	if (ret) {
++		dev_err(cs35l41->dev,
++			"R8Q factory calibration %s unavailable: %d\n", name, ret);
++		goto fail;
++	}
++
++	if (fw->size != CS35L41_R8Q_FACTORY_CAL_SIZE ||
++		memcmp(fw->data, "R8QC", 4) ||
++		get_unaligned_le32(fw->data + 4) != CS35L41_R8Q_FACTORY_CAL_VERSION) {
++		dev_err(cs35l41->dev, "invalid R8Q factory calibration %s\n", name);
++		ret = -EINVAL;
++		goto fail_fw;
++	}
++
++	data = fw->data;
++	rdc = get_unaligned_le32(data + 8);
++	ambient = get_unaligned_le32(data + 12);
++	vsc = get_unaligned_le32(data + 16);
++	isc = get_unaligned_le32(data + 20);
++
++	/* RDC has no vendor bound; constrain it to the 24-bit DSP field. */
++	if (!rdc || rdc > 0x00FFFFFF || ambient > 200 ||
++		!cs35l41_r8q_vimon_value_valid(vsc, CS35L41_R8Q_VSC_UB,
++						CS35L41_R8Q_VSC_LB) ||
++		!cs35l41_r8q_vimon_value_valid(isc, CS35L41_R8Q_ISC_UB,
++						CS35L41_R8Q_ISC_LB)) {
++		dev_err(cs35l41->dev,
++			"R8Q factory calibration values out of bounds\n");
++		ret = -ERANGE;
++		goto fail_fw;
++	}
++
++	/* Keep the exact vendor register order and status/checksum semantics. */
++	ret = cs35l41_r8q_cal_write_verify(cs35l41, CS35L41_R8Q_CAL_RDC, rdc);
++	if (ret)
++		goto fail_fw;
++	ret = cs35l41_r8q_cal_write_verify(cs35l41,
++					   CS35L41_R8Q_CAL_AMBIENT, ambient);
++	if (ret)
++		goto fail_fw;
++	ret = cs35l41_r8q_cal_write_verify(cs35l41,
++					   CS35L41_R8Q_CAL_STATUS, 1);
++	if (ret)
++		goto fail_fw;
++	ret = cs35l41_r8q_cal_write_verify(cs35l41,
++					   CS35L41_R8Q_CAL_CHECKSUM, 1 + rdc);
++	if (ret)
++		goto fail_fw;
++	ret = cs35l41_r8q_cal_write_verify(cs35l41,
++					   CS35L41_R8Q_VIMON_CAL_STATUS,
++					   CS35L41_R8Q_VIMON_STATUS_SUCCESS);
++	if (ret)
++		goto fail_fw;
++	ret = cs35l41_r8q_cal_write_verify(cs35l41,
++					   CS35L41_R8Q_VIMON_CAL_VSC, vsc);
++	if (ret)
++		goto fail_fw;
++	ret = cs35l41_r8q_cal_write_verify(cs35l41,
++					   CS35L41_R8Q_VIMON_CAL_ISC, isc);
++	if (ret)
++		goto fail_fw;
++
++	cs35l41->r8q_calibration_applied = true;
++	dev_dbg(cs35l41->dev, "R8Q factory calibration applied from %s\n", name);
++	release_firmware(fw);
++	mutex_unlock(&cs35l41->r8q_audio_lock);
++	return 0;
++
++fail_fw:
++	release_firmware(fw);
++fail:
++	/* Calibration failure never permits a powered or audible amp. */
++	mute_ret = cs35l41_r8q_force_mute(cs35l41);
++	cs35l41_r8q_first_error(&ret, mute_ret);
++	mutex_unlock(&cs35l41->r8q_audio_lock);
++	return ret;
++}
++
++/* Preserve the OTP cap trims while switching the stock A0 speaker route. */
++static int cs35l41_r8q_cap_trim(struct cs35l41_private *cs35l41,
++					bool receiver_mode)
++{
++	int ret, lock_ret;
++
++	if (!cs35l41->r8q_audio_path ||
++		(cs35l41->r8q_revid & 0xff) != CS35L41_REVID_A0)
++		return 0;
++
++	ret = cs35l41_r8q_cap_key_unlock(cs35l41);
++	if (ret)
++		return ret;
++
++	if (receiver_mode) {
++		ret = regmap_update_bits(cs35l41->regmap, CS35L41_OTP_TRIM_30,
++					 CS35L41_R8Q_INT1_CAP_TRIM_MASK, 0);
++		if (ret >= 0) {
++			ret = regmap_update_bits(cs35l41->regmap, CS35L41_OTP_TRIM_31,
++					 CS35L41_R8Q_INT2_CAP_TRIM_MASK, 0);
++			if (ret >= 0)
++				ret = 0;
++		}
++	} else {
++		ret = regmap_write(cs35l41->regmap, CS35L41_OTP_TRIM_30,
++					cs35l41->r8q_spk_3_trim);
++		if (!ret)
++			ret = regmap_write(cs35l41->regmap, CS35L41_OTP_TRIM_31,
++					cs35l41->r8q_spk_4_trim);
++	}
++
++	lock_ret = cs35l41_r8q_cap_key_lock(cs35l41);
++	if (ret >= 0)
++		ret = lock_ret;
++
++	return ret;
++}
++
++/* Track the stock DSP RX2 source while refusing a DSP route before cal. */
++static int cs35l41_r8q_dsp_rx2_source_event(struct snd_soc_dapm_widget *w,
++						struct snd_kcontrol *kcontrol,
++						int event)
++{
++	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
++	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(component);
++	unsigned int source, global_en;
++	int ret = 0, mute_ret;
++
++	if (!cs35l41->r8q_audio_path ||
++		!(event & (SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_REG)))
++		return 0;
++
++	mutex_lock(&cs35l41->r8q_audio_lock);
++	ret = regmap_read(cs35l41->regmap, CS35L41_DSP1_RX2_SRC, &source);
++	if (ret)
++		goto error_mute;
++
++	source &= CS35L41_ASP_SOURCE_MASK;
++	if (cs35l41_r8q_dsp_source(source) &&
++		!cs35l41->r8q_calibration_applied) {
++		ret = regmap_read(cs35l41->regmap, CS35L41_PWR_CTRL1,
++				  &global_en);
++		if (ret)
++			goto error_mute;
++		/* DAPM may stage the idle graph before preloader POST_PMU. */
++		if ((global_en & CS35L41_GLOBAL_EN_MASK) ||
++			cs35l41->dsp.cs_dsp.running) {
++			dev_err(cs35l41->dev,
++				"refusing active DSP RX2 source before factory calibration\n");
++			ret = -EAGAIN;
++			goto error_mute;
++		}
++	}
++	if (cs35l41_r8q_asp_source(source))
++		cs35l41->r8q_dsprx2_src = source;
++
++	goto out;
++
++error_mute:
++	cs35l41_r8q_clear_resume_latch(cs35l41);
++	mute_ret = cs35l41_r8q_force_mute(cs35l41);
++	cs35l41_r8q_first_error(&ret, mute_ret);
++out:
++	mutex_unlock(&cs35l41->r8q_audio_lock);
++	return ret;
++}
++
++static int cs35l41_r8q_pcm_source_event(struct snd_soc_dapm_widget *w,
++					struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
++	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(component);
++	unsigned int source, global_en;
++	int ret = 0, mute_ret;
++
++	if (!cs35l41->r8q_audio_path || !(event & SND_SOC_DAPM_POST_REG))
++		return 0;
++
++	mutex_lock(&cs35l41->r8q_audio_lock);
++	ret = regmap_read(cs35l41->regmap, CS35L41_DAC_PCM1_SRC, &source);
++	if (ret)
++		goto error_mute;
++
++	source &= CS35L41_ASP_SOURCE_MASK;
++	if (!cs35l41_r8q_asp_source(source) && !cs35l41_r8q_dsp_source(source)) {
++		dev_err(cs35l41->dev, "unsupported R8Q PCM source 0x%x\n", source);
++		ret = -EINVAL;
++		goto error_mute;
++	}
++	if (cs35l41_r8q_dsp_source(source) &&
++		!cs35l41->r8q_calibration_applied) {
++		ret = regmap_read(cs35l41->regmap, CS35L41_PWR_CTRL1,
++				  &global_en);
++		if (ret)
++			goto error_mute;
++		/* Permit only the initial muted, idle DSP route. */
++		if ((global_en & CS35L41_GLOBAL_EN_MASK) ||
++			cs35l41->dsp.cs_dsp.running) {
++			dev_err(cs35l41->dev,
++				"refusing active DSP PCM source before factory calibration\n");
++			ret = -EAGAIN;
++			goto error_mute;
++		}
++	}
++
++	if (source == cs35l41->r8q_pcm_source_last) {
++		cs35l41->r8q_halo_routed = cs35l41_r8q_dsp_source(source);
++		goto out;
++	}
++
++	ret = cs35l41_r8q_cap_trim(cs35l41,
++				   source == CS35L41_INPUT_SRC_ASPRX1);
++	if (ret)
++		goto error_mute;
++
++	ret = regmap_read(cs35l41->regmap, CS35L41_PWR_CTRL1, &global_en);
++	if (ret)
++		goto error_mute;
++
++	/* Pause before committing a live source change; resume after it is written. */
++	if ((global_en & CS35L41_GLOBAL_EN_MASK) && cs35l41->dsp.cs_dsp.running) {
++		ret = cs35l41_r8q_cspl_cmd(cs35l41, CSPL_MBOX_CMD_PAUSE);
++		if (ret)
++			goto error_mute;
++
++		regcache_drop_region(cs35l41->regmap, CS35L41_DAC_PCM1_SRC,
++				     CS35L41_DAC_PCM1_SRC);
++		ret = regmap_write(cs35l41->regmap, CS35L41_DAC_PCM1_SRC, source);
++		if (ret)
++			goto error_mute;
++
++		if (cs35l41_r8q_dsp_source(source)) {
++			ret = cs35l41_r8q_cspl_cmd(cs35l41, CSPL_MBOX_CMD_RESUME);
++			if (ret)
++				goto error_mute;
++		}
++	}
++
++	cs35l41->r8q_pcm_source_last = source;
++	cs35l41->r8q_halo_routed = cs35l41_r8q_dsp_source(source);
++	goto out;
++
++error_mute:
++	cs35l41_r8q_clear_resume_latch(cs35l41);
++	mute_ret = cs35l41_r8q_force_mute(cs35l41);
++	cs35l41_r8q_first_error(&ret, mute_ret);
++out:
++	mutex_unlock(&cs35l41->r8q_audio_lock);
++	return ret;
++}
++
++static int cs35l41_r8q_mute_stream(struct snd_soc_dai *dai, int mute,
++				   int stream)
++{
++	struct cs35l41_private *cs35l41 =
++		snd_soc_component_get_drvdata(dai->component);
++	unsigned int val, source;
++	bool resume_acked;
++	int ret = 0, first = 0;
++
++	if (!cs35l41->r8q_audio_path || stream != SNDRV_PCM_STREAM_PLAYBACK)
++		return 0;
++
++	mutex_lock(&cs35l41->r8q_audio_lock);
++	if (mute) {
++		/* Preserve the ALSA-selected volume across the protected mute window. */
++		ret = regmap_read(cs35l41->regmap, CS35L41_AMP_DIG_VOL_CTRL, &val);
++		if (!ret) {
++			source = (val >> CS35L41_AMP_VOL_PCM_SHIFT) &
++				 CS35L41_AMP_VOL_PCM_MASK;
++			if (source != CS35L41_AMP_VOL_PCM_MUTE) {
++				cs35l41->r8q_pcm_vol_reg = source;
++				cs35l41->r8q_pcm_vol_valid = true;
++				cs35l41->r8q_pcm_vol_ctl =
++					cs35l41_r8q_volume_reg_to_ctl(source);
++				cs35l41->r8q_pcm_vol_ctl_valid = true;
++			}
++		}
++		cs35l41_r8q_first_error(&first, ret);
++
++		ret = regmap_update_bits(cs35l41->regmap,
++			CS35L41_AMP_DIG_VOL_CTRL,
++			CS35L41_AMP_VOL_PCM_MASK << CS35L41_AMP_VOL_PCM_SHIFT,
++			CS35L41_AMP_VOL_PCM_MUTE << CS35L41_AMP_VOL_PCM_SHIFT);
++		cs35l41_r8q_first_error(&first, ret);
++
++		/* Match the vendor soft-ramp wait before direct CSPL MUTE. */
++		ret = cs35l41_r8q_mute_ramp_delay(cs35l41);
++		cs35l41_r8q_first_error(&first, ret);
++
++		ret = cs35l41_r8q_cspl_direct_mute(cs35l41, true);
++		cs35l41_r8q_first_error(&first, ret);
++
++		ret = regmap_read(cs35l41->regmap, CS35L41_DSP1_RX2_SRC, &source);
++		if (!ret && cs35l41_r8q_asp_source(source))
++			cs35l41->r8q_dsprx2_src = source;
++		cs35l41_r8q_first_error(&first, ret);
++
++		ret = regmap_write(cs35l41->regmap, CS35L41_DSP1_RX1_SRC, 0);
++		cs35l41_r8q_first_error(&first, ret);
++		ret = regmap_write(cs35l41->regmap, CS35L41_DSP1_RX2_SRC, 0);
++		cs35l41_r8q_first_error(&first, ret);
++
++		/* This is deliberately last: every failure above still ends here. */
++		ret = cs35l41_r8q_force_mute(cs35l41);
++		cs35l41_r8q_first_error(&first, ret);
++	} else {
++		/* Never unmute before factory calibration or HALO boot. */
++		if (!cs35l41->r8q_calibration_applied ||
++			!cs35l41->dsp.cs_dsp.running ||
++			!cs35l41->r8q_halo_routed) {
++			first = -EAGAIN;
++			goto unmute_error;
++		}
++
++		/* A DAPM callback error may not reach the PCM caller. */
++		mutex_lock(&cs35l41->r8q_cspl_lock);
++		resume_acked = cs35l41->r8q_resume_acked;
++		mutex_unlock(&cs35l41->r8q_cspl_lock);
++		if (!resume_acked) {
++			first = -EAGAIN;
++			goto unmute_error;
++		}
++
++		ret = regmap_write(cs35l41->regmap, CS35L41_DSP1_RX1_SRC,
++				   CS35L41_INPUT_SRC_ASPRX1);
++		cs35l41_r8q_first_error(&first, ret);
++		if (cs35l41_r8q_asp_source(cs35l41->r8q_dsprx2_src)) {
++			ret = regmap_write(cs35l41->regmap, CS35L41_DSP1_RX2_SRC,
++					   cs35l41->r8q_dsprx2_src);
++			cs35l41_r8q_first_error(&first, ret);
++		}
++
++		ret = cs35l41_r8q_cspl_direct_mute(cs35l41, false);
++		cs35l41_r8q_first_error(&first, ret);
++
++		if (!cs35l41->r8q_pcm_vol_valid)
++			first = first ?: -EINVAL;
++		else {
++			ret = regmap_update_bits(cs35l41->regmap,
++				CS35L41_AMP_DIG_VOL_CTRL,
++				CS35L41_AMP_VOL_PCM_MASK << CS35L41_AMP_VOL_PCM_SHIFT,
++				cs35l41->r8q_pcm_vol_reg << CS35L41_AMP_VOL_PCM_SHIFT);
++			cs35l41_r8q_first_error(&first, ret);
++		}
++
++		if (!first) {
++			ret = regmap_update_bits(cs35l41->regmap,
++				CS35L41_AMP_OUT_MUTE,
++				CS35L41_AMP_MUTE_MASK << CS35L41_AMP_MUTE_SHIFT, 0);
++			cs35l41_r8q_first_error(&first, ret);
++			if (ret >= 0)
++				cs35l41->r8q_output_muted = false;
++		}
++	}
++
++	if (mute && first)
++		cs35l41_r8q_clear_resume_latch(cs35l41);
++
++	if (!mute && first)
++		goto unmute_error;
++
++	mutex_unlock(&cs35l41->r8q_audio_lock);
++	return first;
++
++unmute_error:
++	/* Keep analog mute asserted after any failed resume/source/volume step. */
++	cs35l41_r8q_clear_resume_latch(cs35l41);
++	ret = cs35l41_r8q_force_mute(cs35l41);
++	cs35l41_r8q_first_error(&first, ret);
++	mutex_unlock(&cs35l41->r8q_audio_lock);
++	return first;
++}
++
+ static const char * const cs35l41_tx_input_texts[] = {
+ 	"Zero", "ASPRX1", "ASPRX2", "VMON", "IMON",
+ 	"VPMON", "VBSTMON", "DSPTX1", "DSPTX2"
+@@ -326,9 +1162,101 @@
+ static const struct snd_kcontrol_new dsp_rx2_mux =
+ 	SOC_DAPM_ENUM("DSPRX2 SRC", cs35l41_dsprx2_enum);
+ 
++/* Keep the ALSA-selected volume independent from the temporary mute value. */
++static int cs35l41_r8q_pcm_volume_get(struct snd_kcontrol *kcontrol,
++					      struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(component);
++
++	if (!cs35l41->r8q_audio_path)
++		return snd_soc_get_volsw_sx(kcontrol, ucontrol);
++
++	mutex_lock(&cs35l41->r8q_audio_lock);
++	/* An initial hardware mute sentinel is not a selected ALSA value. */
++	ucontrol->value.integer.value[0] =
++		cs35l41->r8q_pcm_vol_ctl_valid ? cs35l41->r8q_pcm_vol_ctl : 0;
++	mutex_unlock(&cs35l41->r8q_audio_lock);
++
++	return 0;
++}
++
++static int cs35l41_r8q_pcm_volume_put(struct snd_kcontrol *kcontrol,
++						      struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(component);
++	unsigned int val, old_ctl;
++	long ctl = ucontrol->value.integer.value[0];
++	bool old_valid, changed_ctl;
++	int ret, changed;
++
++	if (!cs35l41->r8q_audio_path)
++		return snd_soc_put_volsw_sx(kcontrol, ucontrol);
++	if (ctl < 0 || ctl > 0x391)
++		return -EINVAL;
++
++	mutex_lock(&cs35l41->r8q_audio_lock);
++	old_ctl = cs35l41->r8q_pcm_vol_ctl;
++	old_valid = cs35l41->r8q_pcm_vol_ctl_valid;
++	changed_ctl = !old_valid || old_ctl != ctl;
++
++	if (cs35l41->r8q_output_muted) {
++		/* Keep the vendor mute sentinel in hardware while muted. */
++		ret = regmap_update_bits(cs35l41->regmap,
++			CS35L41_AMP_DIG_VOL_CTRL,
++			CS35L41_AMP_VOL_PCM_MASK << CS35L41_AMP_VOL_PCM_SHIFT,
++			CS35L41_AMP_VOL_PCM_MUTE << CS35L41_AMP_VOL_PCM_SHIFT);
++		if (ret < 0)
++			goto fail_mute;
++
++		cs35l41->r8q_pcm_vol_ctl = ctl;
++		cs35l41->r8q_pcm_vol_ctl_valid = true;
++		cs35l41->r8q_pcm_vol_reg =
++			cs35l41_r8q_volume_ctl_to_reg(ctl);
++		cs35l41->r8q_pcm_vol_valid = true;
++		ret = changed_ctl;
++		goto out;
++	}
++
++	changed = snd_soc_put_volsw_sx(kcontrol, ucontrol);
++	if (changed < 0) {
++		ret = changed;
++		goto out;
++	}
++
++	ret = regmap_read(cs35l41->regmap, CS35L41_AMP_DIG_VOL_CTRL, &val);
++	if (ret)
++		goto fail_mute;
++
++	cs35l41->r8q_pcm_vol_reg = (val >> CS35L41_AMP_VOL_PCM_SHIFT) &
++		CS35L41_AMP_VOL_PCM_MASK;
++	cs35l41->r8q_pcm_vol_valid = true;
++	cs35l41->r8q_pcm_vol_ctl = ctl;
++	cs35l41->r8q_pcm_vol_ctl_valid = true;
++	ret = changed || changed_ctl;
++	goto out;
++
++fail_mute:
++	cs35l41_r8q_force_mute(cs35l41);
++out:
++	mutex_unlock(&cs35l41->r8q_audio_lock);
++	return ret;
++}
++
+ static const struct snd_kcontrol_new cs35l41_aud_controls[] = {
+-	SOC_SINGLE_SX_TLV("Digital PCM Volume", CS35L41_AMP_DIG_VOL_CTRL,
+-			  3, 0x4CF, 0x391, dig_vol_tlv),
++	{
++		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
++		.name = "Digital PCM Volume",
++		.access = SNDRV_CTL_ELEM_ACCESS_TLV_READ |
++			SNDRV_CTL_ELEM_ACCESS_READWRITE,
++		.tlv.p = dig_vol_tlv,
++		.info = snd_soc_info_volsw_sx,
++		.get = cs35l41_r8q_pcm_volume_get,
++		.put = cs35l41_r8q_pcm_volume_put,
++		.private_value = SOC_SINGLE_VALUE(CS35L41_AMP_DIG_VOL_CTRL,
++						  3, 0x4CF, 0x391, 0, 0),
++	},
+ 	SOC_SINGLE_TLV("Analog PCM Volume", CS35L41_AMP_GAIN_CTRL, 5, 0x14, 0,
+ 		       amp_gain_tlv),
+ 	SOC_ENUM("PCM Soft Ramp", pcm_sft_ramp),
+@@ -510,24 +1438,85 @@
+ {
+ 	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+ 	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(component);
+-	int ret = 0;
++	int ret = 0, mute_ret;
+ 
+ 	switch (event) {
+ 	case SND_SOC_DAPM_PRE_PMU:
+-		regmap_multi_reg_write_bypassed(cs35l41->regmap,
+-						cs35l41_pup_patch,
+-						ARRAY_SIZE(cs35l41_pup_patch));
+-
+-		ret = cs35l41_global_enable(cs35l41->dev, cs35l41->regmap, cs35l41->hw_cfg.bst_type,
+-					    1, &cs35l41->dsp.cs_dsp);
++		if (cs35l41->r8q_audio_path &&
++			(!cs35l41->r8q_calibration_applied ||
++			 !cs35l41->dsp.cs_dsp.running)) {
++			ret = -EAGAIN;
++			cs35l41_r8q_clear_resume_latch(cs35l41);
++			mute_ret = cs35l41_r8q_force_mute(cs35l41);
++			cs35l41_r8q_first_error(&ret, mute_ret);
++			break;
++		}
++
++		mute_ret = regmap_multi_reg_write_bypassed(cs35l41->regmap,
++						   cs35l41_pup_patch,
++						   ARRAY_SIZE(cs35l41_pup_patch));
++		if (mute_ret < 0 && cs35l41->r8q_audio_path) {
++			cs35l41_r8q_clear_resume_latch(cs35l41);
++			ret = mute_ret;
++			mute_ret = cs35l41_r8q_force_mute(cs35l41);
++			cs35l41_r8q_first_error(&ret, mute_ret);
++			break;
++		}
++
++		ret = cs35l41_global_enable(cs35l41->dev, cs35l41->regmap,
++					    cs35l41->hw_cfg.bst_type, 1,
++					    &cs35l41->dsp.cs_dsp);
++		if (ret && cs35l41->r8q_audio_path) {
++			cs35l41_r8q_clear_resume_latch(cs35l41);
++			mute_ret = cs35l41_r8q_force_mute(cs35l41);
++			cs35l41_r8q_first_error(&ret, mute_ret);
++		}
++		break;
++	case SND_SOC_DAPM_POST_PMU:
++		/* Samsung submits RESUME only after GLOBAL_EN is asserted. */
++		if (!cs35l41->r8q_audio_path)
++			break;
++		if (!cs35l41->r8q_calibration_applied ||
++			!cs35l41->dsp.cs_dsp.running ||
++			!cs35l41->r8q_halo_routed) {
++			ret = -EAGAIN;
++			cs35l41_r8q_clear_resume_latch(cs35l41);
++			mute_ret = cs35l41_r8q_force_mute(cs35l41);
++			cs35l41_r8q_first_error(&ret, mute_ret);
++			break;
++		}
++
++		ret = cs35l41_r8q_cspl_cmd(cs35l41, CSPL_MBOX_CMD_RESUME);
++		if (ret) {
++			cs35l41_r8q_clear_resume_latch(cs35l41);
++			mute_ret = cs35l41_r8q_force_mute(cs35l41);
++			cs35l41_r8q_first_error(&ret, mute_ret);
++		}
+ 		break;
+ 	case SND_SOC_DAPM_POST_PMD:
+-		ret = cs35l41_global_enable(cs35l41->dev, cs35l41->regmap, cs35l41->hw_cfg.bst_type,
+-					    0, &cs35l41->dsp.cs_dsp);
+-
+-		regmap_multi_reg_write_bypassed(cs35l41->regmap,
+-						cs35l41_pdn_patch,
+-						ARRAY_SIZE(cs35l41_pdn_patch));
++		/* Mute before PAUSE and GLOBAL_EN power-down. */
++		if (cs35l41->r8q_audio_path) {
++			/* PAUSE or any preceding error revokes the RESUME grant. */
++			cs35l41_r8q_clear_resume_latch(cs35l41);
++			ret = cs35l41_r8q_force_mute(cs35l41);
++			if (!ret && cs35l41->dsp.cs_dsp.running &&
++				cs35l41->r8q_halo_routed) {
++				mute_ret = cs35l41_r8q_cspl_cmd(cs35l41,
++						CSPL_MBOX_CMD_PAUSE);
++				cs35l41_r8q_first_error(&ret, mute_ret);
++			}
++		}
++
++		mute_ret = cs35l41_global_enable(cs35l41->dev, cs35l41->regmap,
++					    cs35l41->hw_cfg.bst_type, 0,
++					    &cs35l41->dsp.cs_dsp);
++		cs35l41_r8q_first_error(&ret, mute_ret);
++
++		mute_ret = regmap_multi_reg_write_bypassed(cs35l41->regmap,
++						   cs35l41_pdn_patch,
++						   ARRAY_SIZE(cs35l41_pdn_patch));
++		if (cs35l41->r8q_audio_path)
++			cs35l41_r8q_first_error(&ret, mute_ret);
+ 		break;
+ 	default:
+ 		dev_err(cs35l41->dev, "Invalid event = 0x%x\n", event);
+@@ -541,7 +1530,8 @@
+ 	SND_SOC_DAPM_SPK("DSP1 Preload", NULL),
+ 	SND_SOC_DAPM_SUPPLY_S("DSP1 Preloader", 100, SND_SOC_NOPM, 0, 0,
+ 			      cs35l41_dsp_preload_ev,
+-			      SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_PRE_PMD),
++			      SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
++			      SND_SOC_DAPM_PRE_PMD),
+ 	SND_SOC_DAPM_OUT_DRV_E("DSP1", SND_SOC_NOPM, 0, 0, NULL, 0,
+ 			       cs35l41_dsp_audio_ev,
+ 			       SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
+@@ -577,15 +1567,20 @@
+ 
+ 	SND_SOC_DAPM_OUT_DRV_E("Main AMP", CS35L41_PWR_CTRL2, 0, 0, NULL, 0,
+ 			       cs35l41_main_amp_event,
+-			       SND_SOC_DAPM_POST_PMD |	SND_SOC_DAPM_PRE_PMU),
++			       SND_SOC_DAPM_POST_PMD | SND_SOC_DAPM_PRE_PMU |
++			       SND_SOC_DAPM_POST_PMU),
+ 
+ 	SND_SOC_DAPM_MUX("ASP TX1 Source", SND_SOC_NOPM, 0, 0, &asp_tx1_mux),
+ 	SND_SOC_DAPM_MUX("ASP TX2 Source", SND_SOC_NOPM, 0, 0, &asp_tx2_mux),
+ 	SND_SOC_DAPM_MUX("ASP TX3 Source", SND_SOC_NOPM, 0, 0, &asp_tx3_mux),
+ 	SND_SOC_DAPM_MUX("ASP TX4 Source", SND_SOC_NOPM, 0, 0, &asp_tx4_mux),
+ 	SND_SOC_DAPM_MUX("DSP RX1 Source", SND_SOC_NOPM, 0, 0, &dsp_rx1_mux),
+-	SND_SOC_DAPM_MUX("DSP RX2 Source", SND_SOC_NOPM, 0, 0, &dsp_rx2_mux),
+-	SND_SOC_DAPM_MUX("PCM Source", SND_SOC_NOPM, 0, 0, &pcm_source_mux),
++	SND_SOC_DAPM_MUX_E("DSP RX2 Source", SND_SOC_NOPM, 0, 0, &dsp_rx2_mux,
++			   cs35l41_r8q_dsp_rx2_source_event,
++			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_REG),
++	SND_SOC_DAPM_MUX_E("PCM Source", SND_SOC_NOPM, 0, 0, &pcm_source_mux,
++			   cs35l41_r8q_pcm_source_event,
++			   SND_SOC_DAPM_POST_REG),
+ 	SND_SOC_DAPM_SWITCH("DRE", SND_SOC_NOPM, 0, 0, &dre_ctrl),
+ };
+ 
+@@ -758,8 +1753,18 @@
+ {
+ 	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(dai->component);
+ 	unsigned int rate = params_rate(params);
+-	u8 asp_wl;
++	u8 asp_width = params_physical_width(params);
++	u8 asp_wl = params_width(params);
+ 	int i;
++
++	if (cs35l41->r8q_fixed_params) {
++		if (cs35l41->r8q_fixed_rate)
++			rate = cs35l41->r8q_fixed_rate;
++		if (cs35l41->r8q_fixed_width)
++			asp_width = cs35l41->r8q_fixed_width;
++		if (cs35l41->r8q_fixed_wl)
++			asp_wl = cs35l41->r8q_fixed_wl;
++	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(cs35l41_fs_rates); i++) {
+ 		if (rate == cs35l41_fs_rates[i].rate)
+@@ -771,8 +1776,6 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	asp_wl = params_width(params);
+-
+ 	regmap_update_bits(cs35l41->regmap, CS35L41_GLOBAL_CLK_CTRL,
+ 			   CS35L41_GLOBAL_FS_MASK,
+ 			   cs35l41_fs_rates[i].fs_cfg << CS35L41_GLOBAL_FS_SHIFT);
+@@ -780,14 +1783,14 @@
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_FORMAT,
+ 				   CS35L41_ASP_WIDTH_RX_MASK,
+-				   asp_wl << CS35L41_ASP_WIDTH_RX_SHIFT);
++				   asp_width << CS35L41_ASP_WIDTH_RX_SHIFT);
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_RX_WL,
+ 				   CS35L41_ASP_RX_WL_MASK,
+ 				   asp_wl << CS35L41_ASP_RX_WL_SHIFT);
+ 	} else {
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_FORMAT,
+ 				   CS35L41_ASP_WIDTH_TX_MASK,
+-				   asp_wl << CS35L41_ASP_WIDTH_TX_SHIFT);
++				   asp_width << CS35L41_ASP_WIDTH_TX_SHIFT);
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_TX_WL,
+ 				   CS35L41_ASP_TX_WL_MASK,
+ 				   asp_wl << CS35L41_ASP_TX_WL_SHIFT);
+@@ -904,10 +1907,38 @@
+ 	if (hw_cfg->bst_type == CS35L41_EXT_BOOST_NO_VSPK_SWITCH)
+ 		return -EINVAL;
+ 
+-	/* Required */
+-	ret = cs35l41_init_boost(cs35l41->dev, cs35l41->regmap, hw_cfg);
+-	if (ret)
+-		return ret;
++	/*
++	 * The exact Samsung R8Q source has no L/C properties and never calls
++	 * the generic boost table.  Preserve the chip/vendor COEFF and SLOPE
++	 * defaults, apply only the measured DT peak-current value (4100 mA on
++	 * HZE1), and start with boost disabled until DAPM powers Main AMP.
++	 */
++	if (cs35l41->r8q_stock_boost) {
++		unsigned int ipk;
++
++		if (hw_cfg->bst_type != CS35L41_INT_BOOST ||
++		    hw_cfg->bst_ipk < 1600 || hw_cfg->bst_ipk > 4500)
++			return -EINVAL;
++
++		ipk = ((hw_cfg->bst_ipk - 1600) / 50) + 0x10;
++		ret = regmap_update_bits(cs35l41->regmap,
++					CS35L41_BSTCVRT_PEAK_CUR,
++					CS35L41_BST_IPK_MASK << CS35L41_BST_IPK_SHIFT,
++					ipk << CS35L41_BST_IPK_SHIFT);
++		if (ret)
++			return ret;
++
++		ret = regmap_update_bits(cs35l41->regmap, CS35L41_PWR_CTRL2,
++					 CS35L41_BST_EN_MASK,
++					 CS35L41_BST_DIS_FET_OFF << CS35L41_BST_EN_SHIFT);
++		if (ret)
++			return ret;
++	} else {
++		/* Generic boards use the measured L/C table. */
++		ret = cs35l41_init_boost(cs35l41->dev, cs35l41->regmap, hw_cfg);
++		if (ret)
++			return ret;
++	}
+ 
+ 	/* Optional */
+ 	if (hw_cfg->dout_hiz <= CS35L41_ASP_DOUT_HIZ_MASK && hw_cfg->dout_hiz >= 0)
+@@ -929,7 +1960,54 @@
+ {
+ 	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(component);
+ 	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
++	unsigned int val;
+ 	int ret;
++
++	if (cs35l41->r8q_audio_path) {
++		mutex_lock(&cs35l41->r8q_audio_lock);
++
++		/* Capture the post-OTP volume, then force a muted initial graph. */
++		ret = regmap_read(cs35l41->regmap, CS35L41_AMP_DIG_VOL_CTRL, &val);
++		if (ret)
++			goto r8q_init_unlock;
++		cs35l41->r8q_pcm_vol_reg = (val >> CS35L41_AMP_VOL_PCM_SHIFT) &
++			CS35L41_AMP_VOL_PCM_MASK;
++		/* Never treat the vendor mute sentinel as a restore value. */
++		cs35l41->r8q_pcm_vol_valid =
++			cs35l41->r8q_pcm_vol_reg != CS35L41_AMP_VOL_PCM_MUTE;
++		cs35l41->r8q_pcm_vol_ctl_valid = cs35l41->r8q_pcm_vol_valid;
++		if (cs35l41->r8q_pcm_vol_ctl_valid)
++			cs35l41->r8q_pcm_vol_ctl =
++				cs35l41_r8q_volume_reg_to_ctl(cs35l41->r8q_pcm_vol_reg);
++
++		ret = regmap_read(cs35l41->regmap, CS35L41_DSP1_RX2_SRC,
++				  &cs35l41->r8q_dsprx2_src);
++		if (ret)
++			goto r8q_init_unlock;
++		if (!cs35l41_r8q_asp_source(cs35l41->r8q_dsprx2_src))
++			cs35l41->r8q_dsprx2_src = CS35L41_INPUT_SRC_ASPRX1;
++
++		ret = regmap_read(cs35l41->regmap, CS35L41_DAC_PCM1_SRC,
++				  &cs35l41->r8q_pcm_source_last);
++		if (ret)
++			goto r8q_init_unlock;
++		cs35l41->r8q_pcm_source_last &= CS35L41_ASP_SOURCE_MASK;
++		cs35l41->r8q_halo_routed =
++			cs35l41_r8q_dsp_source(cs35l41->r8q_pcm_source_last);
++
++		ret = regmap_update_bits(cs35l41->regmap,
++			CS35L41_AMP_DIG_VOL_CTRL,
++			CS35L41_AMP_VOL_PCM_MASK << CS35L41_AMP_VOL_PCM_SHIFT,
++			CS35L41_AMP_VOL_PCM_MUTE << CS35L41_AMP_VOL_PCM_SHIFT);
++		if (ret < 0)
++			goto r8q_init_unlock;
++		ret = cs35l41_r8q_force_mute(cs35l41);
++
++r8q_init_unlock:
++		mutex_unlock(&cs35l41->r8q_audio_lock);
++		if (ret)
++			return ret;
++	}
+ 
+ 	if (cs35l41->hw_cfg.bst_type == CS35L41_EXT_BOOST) {
+ 		ret = snd_soc_dapm_new_controls(dapm, cs35l41_ext_bst_widget,
+@@ -958,6 +2036,7 @@
+ 	.hw_params = cs35l41_pcm_hw_params,
+ 	.set_sysclk = cs35l41_dai_set_sysclk,
+ 	.set_channel_map = cs35l41_set_channel_map,
++	.mute_stream = cs35l41_r8q_mute_stream,
+ };
+ 
+ #define CS35L41_RATES (		    \
+@@ -1009,10 +2088,15 @@
+ 	.endianness = 1,
+ };
+ 
+-static int cs35l41_handle_pdata(struct device *dev, struct cs35l41_hw_cfg *hw_cfg)
+-{
++static int cs35l41_handle_pdata(struct cs35l41_private *cs35l41,
++				struct cs35l41_hw_cfg *hw_cfg)
++{
++	struct device *dev = cs35l41->dev;
+ 	struct cs35l41_gpio_cfg *gpio1 = &hw_cfg->gpio1;
+ 	struct cs35l41_gpio_cfg *gpio2 = &hw_cfg->gpio2;
++	struct device_node *fixed_params;
++	const char *dsp_part_name;
++	bool r8q_machine;
+ 	unsigned int val;
+ 	int ret;
+ 
+@@ -1074,6 +2158,43 @@
+ 		gpio2->valid = true;
+ 	}
+ 
++	/* Do not let board-only DT extensions alter unrelated CS35L41 boards. */
++	r8q_machine = of_machine_is_compatible("samsung,r8q");
++	if (r8q_machine) {
++		/*
++		 * HZE1 uses a four-slot, 32-bit ASP frame while carrying an S16
++		 * ALSA payload.  Only the physical slot width is fixed here; the
++		 * ASP word length remains params_width() (16) unless separately
++		 * validated against the DSP's alignment expectations.
++		 */
++		fixed_params = dev->of_node ?
++			of_get_child_by_name(dev->of_node, "cirrus,fixed-hw-params") : NULL;
++		cs35l41->r8q_fixed_params = fixed_params != NULL;
++		if (fixed_params) {
++			if (of_property_read_u32(fixed_params, "cirrus,fixed-rate", &val) >= 0)
++				cs35l41->r8q_fixed_rate = val;
++			if (of_property_read_u32(fixed_params, "cirrus,fixed-width", &val) >= 0)
++				cs35l41->r8q_fixed_width = val;
++			if (of_property_read_u32(fixed_params, "cirrus,fixed-wl", &val) >= 0)
++				cs35l41->r8q_fixed_wl = val;
++		}
++		of_node_put(fixed_params);
++
++		if (device_property_read_string(dev, "cirrus,dsp-part-name",
++						&dsp_part_name) >= 0)
++			cs35l41->r8q_dsp_part_name = dsp_part_name;
++		else
++			cs35l41->r8q_dsp_part_name = "cs35l41";
++
++		/* Samsung's source leaves OTP boost coefficient/slope untouched. */
++		cs35l41->r8q_stock_boost = device_property_read_bool(dev,
++							"cirrus,r8q-stock-boost");
++	} else {
++		cs35l41->r8q_fixed_params = false;
++		cs35l41->r8q_dsp_part_name = "cs35l41";
++		cs35l41->r8q_stock_boost = false;
++	}
++
+ 	hw_cfg->valid = true;
+ 
+ 	return 0;
+@@ -1086,7 +2207,7 @@
+ 	int ret;
+ 
+ 	dsp = &cs35l41->dsp;
+-	dsp->part = "cs35l41";
++	dsp->part = cs35l41->r8q_dsp_part_name ?: "cs35l41";
+ 	dsp->fw = 9; /* 9 is WM_ADSP_FW_SPK_PROT in wm_adsp.c */
+ 	dsp->toggle_preload = true;
+ 
+@@ -1205,10 +2326,15 @@
+ 	int irq_pol = 0;
+ 	int ret;
+ 
++	cs35l41->r8q_audio_path = of_machine_is_compatible("samsung,r8q");
++	mutex_init(&cs35l41->r8q_audio_lock);
++	mutex_init(&cs35l41->r8q_cspl_lock);
++	cs35l41->r8q_dsprx2_src = CS35L41_INPUT_SRC_ASPRX1;
++
+ 	if (hw_cfg) {
+ 		cs35l41->hw_cfg = *hw_cfg;
+ 	} else {
+-		ret = cs35l41_handle_pdata(cs35l41->dev, &cs35l41->hw_cfg);
++		ret = cs35l41_handle_pdata(cs35l41, &cs35l41->hw_cfg);
+ 		if (ret != 0)
+ 			return ret;
+ 	}
+@@ -1279,6 +2405,7 @@
+ 	}
+ 
+ 	mtl_revid = reg_revid & CS35L41_MTLREVID_MASK;
++	cs35l41->r8q_revid = reg_revid;
+ 
+ 	/* CS35L41 will have even MTLREVID
+ 	 * CS35L41R will have odd MTLREVID
+@@ -1303,6 +2430,17 @@
+ 		goto err;
+ 	}
+ 
++	if (cs35l41->r8q_audio_path) {
++		ret = regmap_read(cs35l41->regmap, CS35L41_OTP_TRIM_30,
++					  &cs35l41->r8q_spk_3_trim);
++		if (ret)
++			goto err;
++		ret = regmap_read(cs35l41->regmap, CS35L41_OTP_TRIM_31,
++					  &cs35l41->r8q_spk_4_trim);
++		if (ret)
++			goto err;
++	}
++
+ 	cs35l41_test_key_lock(cs35l41->dev, cs35l41->regmap);
+ 
+ 	irq_pol = cs35l41_gpio_config(cs35l41->regmap, &cs35l41->hw_cfg);
+@@ -1342,6 +2480,15 @@
+ 	pm_runtime_set_active(cs35l41->dev);
+ 	pm_runtime_get_noresume(cs35l41->dev);
+ 	pm_runtime_enable(cs35l41->dev);
++	if (cs35l41->r8q_audio_path)
++		/*
++		 * The Samsung Protection v0.0.1 firmware does not implement the
++		 * mainline CSPL hibernate handshake.  Keep this device runtime-PM
++		 * active instead of allowing the PM core to mark its regmap cache-only
++		 * and later issue OUT_OF_HIBERNATE.  DAPM still powers the normal
++		 * global/boost path down when its widgets are idle.
++		 */
++		pm_runtime_forbid(cs35l41->dev);
+ 
+ 	ret = devm_snd_soc_register_component(cs35l41->dev,
+ 					      &soc_component_dev_cs35l41,
+@@ -1359,6 +2506,8 @@
+ 	return 0;
+ 
+ err_pm:
++	if (cs35l41->r8q_audio_path)
++		pm_runtime_allow(cs35l41->dev);
+ 	pm_runtime_dont_use_autosuspend(cs35l41->dev);
+ 	pm_runtime_disable(cs35l41->dev);
+ 	pm_runtime_put_noidle(cs35l41->dev);
+@@ -1375,7 +2524,16 @@
+ 
+ void cs35l41_remove(struct cs35l41_private *cs35l41)
+ {
++	if (cs35l41->r8q_audio_path) {
++		mutex_lock(&cs35l41->r8q_audio_lock);
++		cs35l41_r8q_clear_resume_latch(cs35l41);
++		cs35l41->r8q_calibration_applied = false;
++		mutex_unlock(&cs35l41->r8q_audio_lock);
++	}
++
+ 	pm_runtime_get_sync(cs35l41->dev);
++	if (cs35l41->r8q_audio_path)
++		pm_runtime_allow(cs35l41->dev);
+ 	pm_runtime_dont_use_autosuspend(cs35l41->dev);
+ 	pm_runtime_disable(cs35l41->dev);
+ 
+@@ -1398,12 +2556,31 @@
+ static int cs35l41_runtime_suspend(struct device *dev)
+ {
+ 	struct cs35l41_private *cs35l41 = dev_get_drvdata(dev);
++	int ret;
+ 
+ 	dev_dbg(cs35l41->dev, "Runtime suspend\n");
+ 
+ 	if (!cs35l41->dsp.preloaded || !cs35l41->dsp.cs_dsp.running)
+ 		return 0;
+ 
++	if (cs35l41->r8q_audio_path) {
++		/*
++		 * This is a defensive path for an explicit PM policy override.  The
++		 * normal R8Q policy forbids runtime autosuspend above.  If a caller
++		 * allows it anyway, retain HALO/XMEM and calibration and only assert
++		 * the physical idle mute; never enter the unsupported hibernate
++		 * protocol or regmap cache-only mode.
++		 */
++		mutex_lock(&cs35l41->r8q_audio_lock);
++		ret = cs35l41_r8q_force_mute(cs35l41);
++		mutex_unlock(&cs35l41->r8q_audio_lock);
++		if (ret)
++			return ret;
++
++		/* Keep PM status active if a user overrides the board forbid policy. */
++		return -EBUSY;
++	}
++
+ 	wm_adsp_hibernate(&cs35l41->dsp, true);
+ 	cs35l41_enter_hibernate(dev, cs35l41->regmap, cs35l41->hw_cfg.bst_type);
+ 
+@@ -1419,9 +2596,25 @@
+ 	int ret;
+ 
+ 	dev_dbg(cs35l41->dev, "Runtime resume\n");
+-
+ 	if (!cs35l41->dsp.preloaded || !cs35l41->dsp.cs_dsp.running)
+ 		return 0;
++
++	if (cs35l41->r8q_audio_path) {
++		/*
++		 * No wake command or cache sync is valid for the stock Protection
++		 * firmware.  Verify the retained live state while still muted; later
++		 * unmute remains gated on this calibration state and DSP route.
++		 */
++		mutex_lock(&cs35l41->r8q_audio_lock);
++		ret = cs35l41_r8q_force_mute(cs35l41);
++		if (!ret && !cs35l41->r8q_calibration_applied)
++			ret = -EAGAIN;
++		mutex_unlock(&cs35l41->r8q_audio_lock);
++		if (ret)
++			dev_err(cs35l41->dev,
++				"R8Q runtime resume state is not playable: %d\n", ret);
++		return ret;
++	}
+ 
+ 	regcache_cache_only(cs35l41->regmap, false);
+ 
+@@ -1441,7 +2634,33 @@
+ 		return ret;
+ 	}
+ 
+-	cs35l41_init_boost(cs35l41->dev, cs35l41->regmap, &cs35l41->hw_cfg);
++	if (cs35l41->r8q_stock_boost) {
++		/* Re-apply only the peak field; retain vendor COEFF/SLOPE. */
++		unsigned int ipk = ((cs35l41->hw_cfg.bst_ipk - 1600) / 50) + 0x10;
++
++		ret = regmap_update_bits(cs35l41->regmap,
++					CS35L41_BSTCVRT_PEAK_CUR,
++					CS35L41_BST_IPK_MASK << CS35L41_BST_IPK_SHIFT,
++					ipk << CS35L41_BST_IPK_SHIFT);
++	} else {
++		ret = cs35l41_init_boost(cs35l41->dev, cs35l41->regmap,
++					 &cs35l41->hw_cfg);
++	}
++	if (ret)
++		return ret;
++
++	if (cs35l41->r8q_audio_path) {
++		/* DAPM stays powered across runtime PM; reapply before next unmute. */
++		mutex_lock(&cs35l41->r8q_audio_lock);
++		ret = cs35l41_r8q_force_mute(cs35l41);
++		mutex_unlock(&cs35l41->r8q_audio_lock);
++		if (ret)
++			return ret;
++
++		ret = cs35l41_r8q_apply_factory_cal(cs35l41);
++		if (ret)
++			return ret;
++	}
+ 
+ 	return 0;
+ }
+--- a/sound/soc/codecs/cs35l41.h
++++ b/sound/soc/codecs/cs35l41.h
+@@ -11,12 +11,43 @@
+ #define __CS35L41_H__
+ 
+ #include <linux/gpio/consumer.h>
++#include <linux/mutex.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/firmware.h>
+ #include <sound/core.h>
+ #include <sound/cs35l41.h>
+ 
+ #include "wm_adsp.h"
++
++#define CS35L41_AMP_MUTE_SHIFT		4
++#define CS35L41_AMP_MUTE_MASK		1
++#define CS35L41_AMP_VOL_PCM_SHIFT	3
++#define CS35L41_AMP_VOL_PCM_MASK	0x7FF
++#define CS35L41_AMP_VOL_PCM_MUTE	0x04CF
++
++/* Samsung R8Q HALO factory-calibration structure (DSP 5.01.x). */
++#define CS35L41_R8Q_CAL_RDC		0x02800224
++#define CS35L41_R8Q_CAL_AMBIENT		0x02800228
++#define CS35L41_R8Q_CAL_STATUS		0x0280022C
++#define CS35L41_R8Q_CAL_CHECKSUM		0x02800230
++#define CS35L41_R8Q_VIMON_CAL_STATUS	0x0280006C
++#define CS35L41_R8Q_VIMON_CAL_VSC		0x02800070
++#define CS35L41_R8Q_VIMON_CAL_ISC		0x02800074
++#define CS35L41_R8Q_VIMON_STATUS_SUCCESS	2
++#define CS35L41_R8Q_VSC_UB		0x00010624
++#define CS35L41_R8Q_VSC_LB		0x00FEF9DC
++#define CS35L41_R8Q_ISC_UB		0x00004189
++#define CS35L41_R8Q_ISC_LB		0x00FFBE77
++#define CS35L41_R8Q_CSPL_COMMAND		0x02800210
++#define CS35L41_R8Q_CSPL_CMD_MUTE		1
++#define CS35L41_R8Q_CSPL_CMD_UNMUTE		2
++#define CS35L41_R8Q_INT1_CAP_TRIM_MASK	0x0F80
++#define CS35L41_R8Q_INT2_CAP_TRIM_MASK	0x001F
++/* R8Q vendor mute path: ramp field and AUX-NG entry status bits. */
++#define CS35L41_R8Q_AMP_VOL_RAMP_MASK	0x00000007
++#define CS35L41_R8Q_AMP_VOL_MIN		102
++#define CS35L41_R8Q_AUX_NG_CH1_ENTRY_MASK	0x01000000
++#define CS35L41_R8Q_AUX_NG_CH2_ENTRY_MASK	0x04000000
+ 
+ #define CS35L41_RX_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE)
+ #define CS35L41_TX_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE)
+@@ -33,6 +64,33 @@
+ 	int irq;
+ 	/* GPIO for /RST */
+ 	struct gpio_desc *reset_gpio;
++	/* Samsung R8Q-only DT extensions; generic boards leave these unused. */
++	bool r8q_fixed_params;
++	unsigned int r8q_fixed_rate;
++	unsigned int r8q_fixed_width;
++	unsigned int r8q_fixed_wl;
++	const char *r8q_dsp_part_name;
++	bool r8q_stock_boost;
++	u32 r8q_revid;
++	u32 r8q_spk_3_trim;
++	u32 r8q_spk_4_trim;
++	/* Samsung R8Q stream safety state; generic boards never use it. */
++	bool r8q_audio_path;
++	bool r8q_calibration_applied;
++	bool r8q_output_muted;
++	bool r8q_pcm_vol_valid;
++	unsigned int r8q_pcm_vol_reg;
++	/* Logical SOC_SINGLE_SX value survives the temporary hardware mute. */
++	bool r8q_pcm_vol_ctl_valid;
++	unsigned int r8q_pcm_vol_ctl;
++	unsigned int r8q_dsprx2_src;
++	unsigned int r8q_pcm_source_last;
++	bool r8q_halo_routed;
++	/* Set only after the protected CSPL RESUME ACK and RUNNING readback. */
++	bool r8q_resume_acked;
++	struct mutex r8q_audio_lock;
++	/* Serializes the per-device CSPL IRQ mailbox transaction. */
++	struct mutex r8q_cspl_lock;
+ };
+ 
+ int cs35l41_probe(struct cs35l41_private *cs35l41, const struct cs35l41_hw_cfg *hw_cfg);

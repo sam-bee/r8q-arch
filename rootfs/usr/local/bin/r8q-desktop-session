@@ -46,4 +46,4 @@ Hyprland --verify-config --config "$config"
 
 # One bus is inherited by the compositor and every configured startup client.
 # systemd stops the entire service cgroup when the desktop is stopped.
-exec dbus-run-session -- start-hyprland -- --config "$config"
+exec dbus-run-session -- /usr/local/bin/r8q-desktop-audio-session "$config"

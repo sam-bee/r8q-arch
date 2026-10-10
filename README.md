@@ -43,8 +43,11 @@ into.
 | 13 | **KDE Plasma Mobile** — `sddm` autologin → mobile shell on the Adreno, ~12 s cold boot (GNOME still installed as a fallback) | ✅ |
 | 14 | **CPU wedge root-caused** — the "phone dies under load" bug is `cpu7` never returning from `cpu-sleep-1-0` power collapse; that idle state is now disabled on cpus 4-7 | ✅ fix holding (first 50 min session clean; longer soak still welcome) |
 
+| 15 | **Internal speaker playback** — protected CS35L41 stereo output through Q6AFE/ADSP and desktop PipeWire; survives reboot | PCM/DSP and startup verified; human hearing pending |
+
 See the [**Roadmap**](#roadmap) below for what's next (Bluetooth, USB host mode,
-audio, a greeter/lock screen).
+capture audio, a greeter/lock screen). Internal speaker details are in
+[docs/r8q-audio.md](docs/r8q-audio.md).
 
 Mu-Silicium is
 flashed to `BOOT`; the ESP is the `cache` partition reformatted vfat (`R8QESP`);
@@ -114,7 +117,7 @@ SSH into. What's left, roughly in the order it's worth doing:
 | **Bluetooth** | QCA6390 BT (`hci_qca` over UART/serdev) | Same chip as Wi-Fi, and the `qca6390-pmu` in the DT already drives its BT_EN line — so the power sequencing is done and this is the cheapest remaining win. |
 | **USB host mode** | dwc3 role switch + VBUS (`pm8150b` regulator or powered OTG hub) | Currently peripheral-only (that's how SSH works). Host mode gets a real keyboard/mouse. Needs a role-switch path and VBUS supply. |
 | **Greeter / lock screen** | Replace sddm autologin with a real login | Plasma Mobile already ships `plasma-keyboard` as an on-screen keyboard, so a headless login is now viable. Pure userspace/config work; no kernel changes. |
-| **Audio** | LPASS + WCD938x codec + `cs35l41` speaker amps (SoundWire) | The hardest mainline bring-up here; lowest priority for a dev device. |
+| **Microphone / headset audio** | Additional capture/codec routes and userspace configuration | The current CS35L41 card exposes internal stereo playback only. |
 
 ## The short version of how it boots
 

@@ -16,6 +16,9 @@
       "center": [],
       "right": [
         {
+          "id": "omarchy.audio"
+        },
+        {
           "id": "omarchy.clock",
           "format": "HH:mm",
           "formatAlt": "d MMMM yyyy"
@@ -31,7 +34,6 @@
     "omarchy.reminders",
     "omarchy.menu",
     "omarchy.notifications",
-    "omarchy.audio",
     "omarchy.bluetooth",
     "omarchy.monitor",
     "omarchy.network",

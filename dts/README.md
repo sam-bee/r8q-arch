@@ -27,3 +27,8 @@ pd_ignore_unused arm-smmu.disable_bypass=0`).
 Good upstream-patch candidate for samsung-r8q (the `protected-clocks` + fb
 power-domain pattern is the sanctioned "no panel driver yet" approach; cf.
 `sm8250-sony-xperia-edo.dtsi`, which uses the clock-hold variant).
+
+The builder appends `sm8250-samsung-r8q-audio.dtsi` after the complete board
+definition. Its memory and graph includes retain the verified Samsung ADSP
+reservation and connect the stereo CS35L41 amplifiers to primary TDM. See
+`docs/r8q-audio.md` for the required matching drivers and firmware.

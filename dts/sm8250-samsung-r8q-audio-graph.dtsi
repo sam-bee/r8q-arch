@@ -1,0 +1,180 @@
+/*
+ * Persistent SM-G7810/r8q audio graph.
+ *
+ * This fragment is included after sm8250-samsung-r8q.dts (which already
+ * includes sm8250.dtsi). It describes the complete audio graph used by
+ * r8q-cs35l41-card.c. The ADSP reserved-memory correction is separate and
+ * must be applied before enabling &adsp.
+ *
+ * The exact HZE1 Samsung driver does not provide physical L/C values: it
+ * leaves the OTP/vendor BSTCVRT coefficient and slope defaults untouched and
+ * applies only the stock 4100 mA peak setting. The board amp source carries
+ * that behavior behind cirrus,r8q-stock-boost. Do not use these nodes with
+ * the unmodified generic CS35L41 driver.
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/sound/qcom,q6afe.h>
+#include <dt-bindings/sound/qcom,q6asm.h>
+
+/ {
+	r8q_cs35_dummy_vreg: cs35-dummy-vreg {
+		compatible = "regulator-fixed";
+		regulator-name = "cs35l41-dummy";
+		regulator-always-on;
+		regulator-boot-on;
+	};
+};
+
+&tlmm {
+	r8q_cs35_i2c11_sleep: cs35-i2c11-sleep-state {
+		pins = "gpio60", "gpio61";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	r8q_cs35_irq_default: cs35-irq-default-state {
+		/* GPIO84 is a shared, active-low CS35L41 INTB line. */
+		pins = "gpio84";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	r8q_cs35_right_reset_default: cs35-right-reset-default-state {
+		/* GPIO69 is the physical active-low reset for the right/bottom amp. */
+		pins = "gpio69";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	r8q_cs35_left_reset_default: cs35-left-reset-default-state {
+		/* GPIO75 is the physical active-low reset for the left/receiver amp. */
+		pins = "gpio75";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
+&i2c11 {
+	status = "okay";
+	clock-frequency = <1000000>;
+	pinctrl-names = "default", "sleep";
+	/* Keep the shared INTB pin configured while either child is bound. */
+	pinctrl-0 = <&qup_i2c11_default>, <&r8q_cs35_irq_default>;
+	pinctrl-1 = <&r8q_cs35_i2c11_sleep>, <&r8q_cs35_irq_default>;
+
+	cs35l41_right: cs35l41@40 {
+		#sound-dai-cells = <1>;
+		compatible = "cirrus,cs35l41";
+		reg = <0x40>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <84 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 69 GPIO_ACTIVE_HIGH>;
+		VA-supply = <&r8q_cs35_dummy_vreg>;
+		VP-supply = <&r8q_cs35_dummy_vreg>;
+		sound-name-prefix = "Right";
+		pinctrl-names = "default";
+		pinctrl-0 = <&r8q_cs35_right_reset_default>;
+
+		cirrus,r8q-stock-boost;
+		cirrus,boost-peak-milliamp = <4100>;
+		cirrus,dsp-part-name = "cs35l40-bot";
+		cirrus,use-fsync-errata;
+		cirrus,asp-sdout-hiz = <3>;
+		cirrus,gpio2-src-select = <4>;
+		cirrus,gpio2-output-enable;
+		cirrus,fixed-hw-params {
+			cirrus,fixed-width = <32>;
+		};
+	};
+
+	cs35l41_left: cs35l41@41 {
+		#sound-dai-cells = <1>;
+		compatible = "cirrus,cs35l41";
+		reg = <0x41>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <84 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 75 GPIO_ACTIVE_HIGH>;
+		VA-supply = <&r8q_cs35_dummy_vreg>;
+		VP-supply = <&r8q_cs35_dummy_vreg>;
+		sound-name-prefix = "Left";
+		pinctrl-names = "default";
+		pinctrl-0 = <&r8q_cs35_left_reset_default>;
+
+		cirrus,r8q-stock-boost;
+		cirrus,boost-peak-milliamp = <4100>;
+		cirrus,dsp-part-name = "cs35l40-rcv";
+		cirrus,use-fsync-errata;
+		cirrus,asp-sdout-hiz = <3>;
+		cirrus,gpio2-src-select = <4>;
+		cirrus,gpio2-output-enable;
+		cirrus,fixed-hw-params {
+			cirrus,fixed-width = <32>;
+		};
+	};
+};
+
+/*
+ * q6asm-dai enumerates children at probe time.  The runtime card references
+ * Multimedia1, so keep an explicit playback-only FE in the persistent tree.
+ * Q6ASM_DAI_RX means RX from the DSP to the playback PCM stream; the driver
+ * removes the capture stream for this DAI.
+ */
+&q6asmdai {
+	dai@0 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA1>;
+		direction = <Q6ASM_DAI_RX>;
+	};
+};
+
+&q6afedai {
+	/* PRIMARY_TDM_RX_0 is 24; all six TDM properties are required. */
+	primary_tdm_rx0: dai@24 {
+		reg = <PRIMARY_TDM_RX_0>;
+		qcom,tdm-sync-mode = <0>;
+		qcom,tdm-sync-src = <1>;
+		qcom,tdm-data-out = <0>;
+		qcom,tdm-invert-sync = <0>;
+		qcom,tdm-data-delay = <1>;
+		qcom,tdm-data-align = <0>;
+	};
+};
+
+&sound {
+	compatible = "samsung,r8q-cs35l41-sndcard";
+	model = "Samsung r8q CS35L41";
+	status = "okay";
+	pinctrl-names = "default";
+	/* The stock primary TDM pins are named pri-mi2s in the SoC DTS. */
+	pinctrl-0 = <&pri_mi2s_active>;
+
+	widgets = "Speaker", "Speaker";
+	audio-routing =
+		"Speaker", "Left SPK",
+		"Speaker", "Right SPK";
+
+	mm1-dai-link {
+		link-name = "MultiMedia1";
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>;
+		};
+	};
+
+	primary-tdm-dai-link {
+		link-name = "Primary TDM Speaker";
+		cpu {
+			sound-dai = <&q6afedai PRIMARY_TDM_RX_0>;
+		};
+		codec {
+			sound-dai = <&cs35l41_left 0>, <&cs35l41_right 0>;
+		};
+		platform {
+			sound-dai = <&q6routing>;
+		};
+	};
+};

@@ -20,6 +20,13 @@ libbsd
 libmd
 ttf-jetbrains-mono-nerd
 
+# Phone speaker runtime, verified with the signed Arch Linux ARM resolver.
+alsa-utils
+pipewire-audio
+pipewire-pulse
+pipewire-alsa
+wireplumber
+
 # Quickshell dependency closure (let the signed resolver select versions):
 # qt6-base qt6-declarative qt6-svg qt6-wayland libpipewire polkit pam
 # cpptrace jemalloc hicolor-icon-theme libdrm libxcb mesa wayland

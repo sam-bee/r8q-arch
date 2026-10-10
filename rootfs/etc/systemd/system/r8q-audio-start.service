@@ -1,0 +1,15 @@
+[Unit]
+Description=Private Samsung r8q exact-release audio bring-up (v10 amp + v8 Q6AFE; validated hardware)
+ConditionPathExists=/proc/device-tree/compatible
+After=local-fs.target
+Before=sound.target
+
+[Service]
+TimeoutStartSec=120
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/r8q-audio/7.1.2-r8q-rtc2/load-r8q-audio.sh
+ExecStartPost=/opt/r8q-audio/7.1.2-r8q-rtc2/init-r8q-audio.sh
+
+[Install]
+WantedBy=multi-user.target

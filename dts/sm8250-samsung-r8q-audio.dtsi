@@ -1,0 +1,8 @@
+/*
+ * Audio graph aggregator for arch/arm64/boot/dts/qcom/.
+ * The graph include is paired with the reviewed codec/card source and must
+ * remain paired with the v10 codec and matched Q6AFE source.
+ */
+
+#include "sm8250-samsung-r8q-audio-memory.dtsi"
+#include "sm8250-samsung-r8q-audio-graph.dtsi"

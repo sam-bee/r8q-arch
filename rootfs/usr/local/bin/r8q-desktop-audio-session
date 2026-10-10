@@ -1,0 +1,47 @@
+#!/bin/sh
+# Audio servers share the desktop's private runtime and D-Bus session.
+set -eu
+test "$(id -un)" = alarm
+: "${XDG_RUNTIME_DIR:?}"
+: "${DBUS_SESSION_BUS_ADDRESS:?}"
+test "$(stat -c '%U:%a' "$XDG_RUNTIME_DIR")" = alarm:700
+config=$1
+test -r "$config"
+for program in pipewire wireplumber pipewire-pulse start-hyprland; do command -v "$program" >/dev/null; done
+for name in pipewire wireplumber pipewire-pulse; do
+ if pgrep -u "$(id -u)" -x "$name" >/dev/null; then echo "Audio server already running: $name" >&2; exit 1; fi
+done
+children=""
+cleanup() {
+ status=$?
+ trap - EXIT
+ for pid in $children; do kill "$pid" 2>/dev/null || true; done
+ for pid in $children; do wait "$pid" 2>/dev/null || true; done
+ exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+pipewire > "$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
+children="$children $!"
+for attempt in $(seq 1 50); do
+ test -S "$XDG_RUNTIME_DIR/pipewire-0" && break
+ sleep 0.1
+done
+test -S "$XDG_RUNTIME_DIR/pipewire-0"
+wireplumber > "$XDG_RUNTIME_DIR/wireplumber.log" 2>&1 &
+wp_pid=$!
+children="$children $wp_pid"
+pipewire-pulse > "$XDG_RUNTIME_DIR/pipewire-pulse.log" 2>&1 &
+pulse_pid=$!
+children="$children $pulse_pid"
+for attempt in $(seq 1 50); do
+ kill -0 "$wp_pid" "$pulse_pid"
+ test -S "$XDG_RUNTIME_DIR/pulse/native" && break
+ sleep 0.1
+done
+test -S "$XDG_RUNTIME_DIR/pulse/native"
+start-hyprland -- --config "$config" &
+desktop_pid=$!
+children="$children $desktop_pid"
+wait "$desktop_pid"

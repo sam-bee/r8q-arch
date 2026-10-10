@@ -74,6 +74,9 @@ cd "$KSRC"
 # Install the r8q device tree sources into the kernel tree.
 for target in arch/arm64/boot/dts/qcom/sm8250-samsung-common.dtsi \
               arch/arm64/boot/dts/qcom/sm8250-samsung-r8q.dts \
+              arch/arm64/boot/dts/qcom/sm8250-samsung-r8q-audio.dtsi \
+              arch/arm64/boot/dts/qcom/sm8250-samsung-r8q-audio-memory.dtsi \
+              arch/arm64/boot/dts/qcom/sm8250-samsung-r8q-audio-graph.dtsi \
               drivers/input/touchscreen/fts5cu56a.c; do
     if [[ -L "$target" ]]; then
         echo "Refusing symlinked source destination: $KSRC/$target" >&2
@@ -82,7 +85,14 @@ for target in arch/arm64/boot/dts/qcom/sm8250-samsung-common.dtsi \
 done
 cp "$REPO"/dts/sm8250-samsung-common.dtsi \
    "$REPO"/dts/sm8250-samsung-r8q.dts \
+   "$REPO"/dts/sm8250-samsung-r8q-audio.dtsi \
+   "$REPO"/dts/sm8250-samsung-r8q-audio-memory.dtsi \
+   "$REPO"/dts/sm8250-samsung-r8q-audio-graph.dtsi \
    arch/arm64/boot/dts/qcom/
+
+# Append after the full board definition so audio memory and DSP overrides win.
+printf '\n#include "sm8250-samsung-r8q-audio.dtsi"\n' >> \
+    arch/arm64/boot/dts/qcom/sm8250-samsung-r8q.dts
 
 # Patch 0004 adds only Kconfig/Makefile entries; the driver is a separate file.
 cp "$REPO/patches/fts5cu56a.c" drivers/input/touchscreen/fts5cu56a.c
@@ -106,7 +116,8 @@ make O="$OUT" defconfig
 scripts/kconfig/merge_config.sh \
     -O "$OUT" \
     -m "$OUT/.config" \
-    "$REPO/config/r8q_bringup.config"
+    "$REPO/config/r8q_bringup.config" \
+    "$REPO/config/r8q_audio_integration.config"
 
 # These paths are checkout-specific, so don't hard-code them in the
 # version-controlled Kconfig fragment.

@@ -94,3 +94,10 @@ hl.on("hyprland.start", function()
   hl.exec_cmd("omarchy-launch-shell")
   hl.exec_cmd("hypridle -c /usr/share/r8q/omarchy/phone-hypridle.conf")
 end)
+
+-- The private desktop PipeWire session owns the speaker volume.
+for key, change in pairs({ XF86AudioRaiseVolume = "5%+", XF86AudioLowerVolume = "5%-" }) do
+  hl.bind(key, function()
+    hl.exec_cmd("wpctl set-volume --limit 1 @DEFAULT_AUDIO_SINK@ " .. change)
+  end, { locked = true, ignore_mods = true, dont_inhibit = true, submap_universal = true })
+end

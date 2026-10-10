@@ -209,10 +209,10 @@ gates remain separate.
 
 The actual current Omarchy shell is Quickshell, not a Waybar-labelled
 substitute. The phone configuration enables workspaces, a clock, the image
-background and the small `r8q.launcher` plugin. The plugin's touch-sized
+background, audio controls and the small `r8q.launcher` plugin. The plugin's touch-sized
 controls launch `foot`
 and call the verified `sm.puri.OSK0.SetVisible` session method. Notifications,
-audio, Bluetooth, network, power, battery, idle, lock, OSD and polkit plugins
+Bluetooth, network, power, battery, idle, lock, OSD and polkit plugins
 are explicitly disabled until their phone package and hardware gates pass.
 The earlier GTK3 touch/application and Squeekboard text-entry trial passed;
 that does not establish physical touch on the native Qt plugin buttons. The
@@ -333,3 +333,11 @@ ownership/mode metadata are in `/root/r8q-screen-off-backup/`.
 The timer, bind flags and DPMS fields follow the official
 [Hyprland dispatcher reference](https://wiki.hypr.land/configuring/core/dispatchers/)
 and [hypridle configuration](https://wiki.hypr.land/Hypr-Ecosystem/hypridle/).
+
+## Internal speaker audio
+
+The desktop now starts PipeWire, WirePlumber and pipewire-pulse inside its
+private D-Bus session. The Phone speakers output uses software volume, exposed
+by the Omarchy audio panel and physical volume buttons. See
+[r8q-audio.md](r8q-audio.md) for the protected driver/firmware path, exact-release
+startup, packaging and recovery details.

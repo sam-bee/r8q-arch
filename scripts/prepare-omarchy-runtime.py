@@ -36,6 +36,14 @@ SOURCE_FILES = (
     'config/omarchy/shell.json',
     'bin/omarchy-launch-shell',
     'bin/omarchy-shell',
+    # The audio panel invokes these helpers through Quickshell Process and
+    # execDetached.  Its sink-availability probe calls audio-tuning only to
+    # detect an existing tuning; no tuning payload or service is staged.
+    'bin/omarchy-audio-output-sink',
+    'bin/omarchy-audio-sink-availability',
+    'bin/omarchy-audio-output-set-default',
+    'bin/omarchy-audio-input-set-default',
+    'bin/omarchy-audio-tuning',
     # The pinned Tokyo Night selection is deliberately limited to the color
     # data, two authentic wallpaper choices, and the templates/helpers needed
     # to apply them. Other themes, app templates and picker helpers stay out;
@@ -65,6 +73,11 @@ RUNTIME_OVERLAY_PREFIXES = {
 ABSOLUTE_SYMLINKS = {
     'usr/bin/omarchy-launch-shell': '/usr/share/omarchy/bin/omarchy-launch-shell',
     'usr/bin/omarchy-shell': '/usr/share/omarchy/bin/omarchy-shell',
+    'usr/bin/omarchy-audio-output-sink': '/usr/share/omarchy/bin/omarchy-audio-output-sink',
+    'usr/bin/omarchy-audio-sink-availability': '/usr/share/omarchy/bin/omarchy-audio-sink-availability',
+    'usr/bin/omarchy-audio-output-set-default': '/usr/share/omarchy/bin/omarchy-audio-output-set-default',
+    'usr/bin/omarchy-audio-input-set-default': '/usr/share/omarchy/bin/omarchy-audio-input-set-default',
+    'usr/bin/omarchy-audio-tuning': '/usr/share/omarchy/bin/omarchy-audio-tuning',
 }
 
 
