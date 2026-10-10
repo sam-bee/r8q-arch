@@ -9,6 +9,7 @@ xdg-desktop-portal-gtk
 wl-clipboard
 wtype
 inotify-tools
+hypridle
 squeekboard
 python-gobject
 gtk3

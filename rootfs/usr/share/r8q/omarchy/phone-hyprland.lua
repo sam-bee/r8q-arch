@@ -2,8 +2,8 @@
 --
 -- This deliberately stays independent of Omarchy's full default/hypr tree.
 -- It preserves the already validated phone output, touch mapping and
--- compositor power policy while starting only the Quickshell host and the
--- existing, separately reviewed on-screen-keyboard helper.
+-- compositor suspend policy while starting Quickshell, the on-screen keyboard
+-- and a display-only idle timer.
 
 local omarchy_path = os.getenv("OMARCHY_PATH") or "/usr/share/omarchy"
 local inherited_path = os.getenv("PATH") or "/usr/local/bin:/usr/bin"
@@ -49,6 +49,10 @@ hl.config({
     disable_splash_rendering = true,
     force_default_wallpaper = 0,
     background_color = 0xff1a1b26,
+    -- The side button owns waking. Automatic wake would race its toggle and
+    -- could immediately turn the display back off after an idle timeout.
+    key_press_enables_dpms = false,
+    mouse_move_enables_dpms = false,
   },
   decoration = {
     rounding = 0,
@@ -64,6 +68,20 @@ hl.config({
 -- Install this theme file before deploying or verifying the phone profile.
 dofile((os.getenv("HOME") or "/home/alarm") .. "/.local/state/omarchy/current/theme/hyprland.lua")
 
+-- Dispatch DPMS after the key event completes, as required by Hyprland.
+-- Release-only, non-repeating handling gives one toggle per short press.
+hl.bind("XF86PowerOff", function()
+  hl.timer(function()
+    hl.dispatch(hl.dsp.dpms({ monitor = "DSI-1", action = "toggle" }))
+  end, { timeout = 200, type = "oneshot" })
+end, {
+  release = true,
+  locked = true,
+  ignore_mods = true,
+  dont_inhibit = true,
+  submap_universal = true,
+})
+
 hl.on("hyprland.start", function()
   -- Update this session's private bus for portal activation. This system
   -- service has no user-manager bus in its private XDG_RUNTIME_DIR.
@@ -74,4 +92,5 @@ hl.on("hyprland.start", function()
   -- replace it with Omarchy's idle/power/lock startup.
   hl.exec_cmd("/usr/local/bin/r8q-squeekboard")
   hl.exec_cmd("omarchy-launch-shell")
+  hl.exec_cmd("hypridle -c /usr/share/r8q/omarchy/phone-hypridle.conf")
 end)

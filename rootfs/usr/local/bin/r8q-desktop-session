@@ -29,9 +29,10 @@ test -c /dev/dri/by-path/platform-3d00000.gpu-render
 test -S /run/seatd.sock
 for program in dbus-run-session start-hyprland Hyprland squeekboard ldd pgrep \
     gdbus gsettings foot quickshell omarchy-launch-shell inotifywait \
-    dbus-update-activation-environment; do
+    dbus-update-activation-environment hypridle; do
     command -v "$program" >/dev/null
 done
+test -r /usr/share/r8q/omarchy/phone-hypridle.conf
 if pgrep -x Hyprland >/dev/null || pgrep -x start-hyprland >/dev/null; then
     echo 'A compositor or its watchdog is already running' >&2
     exit 1

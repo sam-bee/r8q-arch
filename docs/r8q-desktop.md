@@ -11,14 +11,14 @@ The review manifest is [rootfs/usr/share/r8q/omarchy/omarchy-runtime.packages](.
 The first synchronized official Arch Linux ARM transaction should query the
 complete dependency closure and retain its signed receipt. The intended shell
 names are `quickshell`, the three XDG portals, `wl-clipboard`, `wtype`,
-`inotify-tools`, `squeekboard`, `python-gobject`, `gtk3`, `jq`, `perl`,
+`inotify-tools`, `hypridle`, `squeekboard`, `python-gobject`, `gtk3`, `jq`, `perl`,
 `gum`, `libbsd`, `libmd`, and the available JetBrains Mono Nerd font package.
 `libbsd` and `libmd` cover the packaged Squeekboard runtime's undeclared
 shared-library closure. The resolver may add the Quickshell/portal Qt6,
 PipeWire, polkit, PAM, Wayland and graphics dependencies.
 
 Do not install `omarchy-settings`, the full `omarchy` package, SDDM, Mac/Asahi
-packages, firewall or power/idle packages for this first gate. The full package
+packages, firewall or a general power-management stack for this gate. The full package
 pair has broad dependencies and global hooks; the phone runtime is a source
 overlay. A synchronized transaction is a bounded phone operation and must
 preserve the existing kernel, firmware, boot, network and SSH package baseline.
@@ -121,7 +121,8 @@ simpledrm display by-path, DSI-1 connection, Adreno render by-path,
 before it runs `dbus-run-session -- start-hyprland`. Startup updates the shared
 activation environment with `dbus-update-activation-environment --all`; it does
 not import a nonexistent user-manager environment. The phone Lua starts the
-already reviewed Squeekboard helper and launches `omarchy-launch-shell`. It
+already reviewed Squeekboard helper, launches `omarchy-launch-shell`, and starts
+the separately configured display-only `hypridle` daemon. It
 does not invoke Omarchy's power, idle, monitor-watch, automount, lock or
 first-run hooks. Do not change the existing MAX77705 route ownership or add a
 display manager.
@@ -200,8 +201,9 @@ The primary agent should pass each gate independently:
 5. Recheck both SSH routes, USB/MAX77705 route ownership and hashes after a
    bounded UI reboot/soak. Battery-driver acceptance remains a separate gate.
 
-No idle/suspend, power-profile, firewall, SDDM, bootloader, filesystem or
-Apple-specific hardware gate is folded into this desktop payload.
+Display blanking has its own configuration and acceptance below. Suspend,
+power-profile, firewall, SDDM, bootloader, filesystem and Apple-specific hardware
+gates remain separate.
 
 ## Current limited shell
 
@@ -283,3 +285,51 @@ source preparation has been validated on the laptop by staging the pinned local
 archive into a fresh output and independently checking all manifest hashes. The
 phone's rendered shell observation is complete; physical control acceptance
 remains a separate gate.
+
+## Idle blanking and side button
+
+The phone profile starts `hypridle` with
+`/usr/share/r8q/omarchy/phone-hypridle.conf`. After 120 seconds without seat
+input it disables DPMS on `DSI-1`. The Lua binds a short Side/Power press on
+release to a delayed DPMS toggle: one press blanks the display, another wakes
+it. Automatic key/mouse wake and hypridle's `on-resume` action are disabled
+so that a wake event cannot race the button toggle. Wake uses the side button;
+touching the dark screen does not wake it. Idle inhibitors retain their default
+behavior, so an application may intentionally keep the screen awake.
+
+This policy does not start a lock screen or suspend Linux. The normal desktop,
+USB route and Wi-Fi continue running. The display currently uses `simpledrm`:
+its plane-disable implementation clears the firmware framebuffer to black.
+The observed DRM `active=0` state and compositor DPMS status establish blanking;
+they do not establish panel rail power-off or system suspend.
+
+Deploy the signed phone `hypridle` package and both phone profiles before
+updating the session. The offline preparer stages the idle profile under both
+`/usr/share/r8q/omarchy/` and `/usr/share/omarchy/`. Separately install the
+tracked `rootfs/etc/systemd/logind.conf.d/50-r8q-screen-button.conf` into the
+phone's `/etc/systemd/logind.conf.d/`, along with the updated session helper.
+The logind drop-in disables its poweroff action for the same button. Apply
+with `systemctl reload systemd-logind` on the current `Type=notify-reload`
+unit, then verify `HandlePowerKey` and `HandlePowerKeyLongPress` both return
+`s "ignore"` via the login1 Manager D-Bus properties. Save the previous files
+before replacement. Reload Hyprland and start hypridle within the desktop
+session for an existing boot; the `hyprland.start` hook starts it on future
+desktop sessions. Keep Omarchy's full idle/power/lock plugins disabled.
+
+From a terminal in this desktop, SSH recovery can explicitly wake with:
+
+```sh
+hyprctl dispatch 'hl.dsp.dpms({ monitor = "DSI-1", action = "enable" })'
+```
+
+An SSH shell must run that command as `alarm` with the current compositor's
+`XDG_RUNTIME_DIR=/run/r8q-desktop` and `HYPRLAND_INSTANCE_SIGNATURE`. Record
+the real 120-second idle transition and physical Side/Power wake separately
+from direct dispatcher tests. Recheck both SSH routes and the desktop PID after
+testing. The current file baseline is `/root/r8q-desktop-screen-off.sha256`;
+the wallpaper baseline is retained as a historical receipt. Backups and
+ownership/mode metadata are in `/root/r8q-screen-off-backup/`.
+
+The timer, bind flags and DPMS fields follow the official
+[Hyprland dispatcher reference](https://wiki.hypr.land/configuring/core/dispatchers/)
+and [hypridle configuration](https://wiki.hypr.land/Hypr-Ecosystem/hypridle/).

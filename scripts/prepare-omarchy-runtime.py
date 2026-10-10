@@ -54,6 +54,7 @@ SOURCE_FILES = (
 # manifest entries makes the only changed upstream path auditable.
 RUNTIME_OVERLAY_FILES = {
     'phone-hyprland.lua': 'phone-hyprland.lua',
+    'phone-hypridle.conf': 'phone-hypridle.conf',
     'phone-session.env': 'phone-session.env',
     'phone-shell.json': 'config/omarchy/shell.json',
     'omarchy-runtime.packages': 'config/omarchy/omarchy-runtime.packages',
