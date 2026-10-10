@@ -170,8 +170,8 @@
 	status = "okay";
 
 	/*
-	 * MAX77705 top PMIC / MUIC + charger. This unit reports silicon rev
-	 * PASS2 (0x2); mainline mfd/max77705.c only whitelisted PASS3, so it
+	 * MAX77705 top PMIC / MUIC + charger. This unit reports PMIC revision
+	 * 0x2; mainline mfd/max77705.c only whitelisted revision 0x3, so it
 	 * needs the r8q PASS2-accept patch (patches/0005) to probe. IRQ is on
 	 * pm8150L gpio11, level-low (from the stock DT: irq-gpio pm8150l 0xb).
 	 */
@@ -269,8 +269,9 @@
 		pins = "gpio11";
 		function = "normal";
 		input-enable;
-		bias-disable;
-		power-source = <0>;
+		/* Match SM-G7810 stock chg_int_default: idle IRQ must stay high. */
+		bias-pull-up;
+		power-source = <1>;
 	};
 };
 

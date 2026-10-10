@@ -231,9 +231,10 @@ PMIC/MUIC at `0x66`, and the charger at `0x69`.
 - **Charging:** the `max77705` MFD (`pmic@66`) + `max77705-charger` (`charger@69`)
   drivers, with a `simple-battery` node supplying the charge parameters, drive the
   charger so the phone actually refills (`max77705-charger` shows `status =
-  Charging`). This unit's MAX77705 reports silicon revision **PASS2**, which
-  mainline's MFD rejects (it only whitelists PASS3), so `patches/0005` relaxes that
-  check — the register layout is identical on PASS2.
+  Charging`). This unit reports PMIC ID **0x15**, revision **0x02**, which
+  mainline's MFD rejects (it only whitelists revision 0x03), so `patches/0005`
+  accepts revision 0x02. Samsung names this silicon MD15 PASS2 and maps it to
+  its logical `MAX77705_PASS5` enum; see the IRQ investigation below.
 
 `r8q-battery.service` loads all three modules after the USB gadget, recovery
 route, and touchscreen startup. On the validated SM-G7810 RTC2 image, its
@@ -249,6 +250,13 @@ IRQ215 storms followed by SE0 I2C timeouts. Successful module loading and
 polling telemetry did not establish reliable charger events. The independent
 desktop service can start without these drivers; see the desktop document for
 the recorded evidence and current deployment policy.
+
+The IRQ investigation identified a stock pin-state mismatch: GPIO11 needs
+`bias-pull-up` and VIN selector 1, while the previous source used no pull and
+selector 0. The source now matches stock. A temporary runtime trial released
+the low line and delivered a handled charger interrupt; the persistent RTC2
+image still needs a corrected DTB and repeat startup validation before
+autoload is enabled. See [the IRQ investigation](docs/max77705-irq.md).
 
 Mainline has no driver for the MAX77705's MUIC, so the
 port type is never detected and the charger stays at the USB-SDP default of
