@@ -1,0 +1,4 @@
+# Phone-side packages required by r8q-usb-route-ensure.sh.
+# This is a declaration for the Arch rootfs/package bootstrap; it does not
+# install laptop packages and is intentionally not consumed by the host build.
+i2c-tools

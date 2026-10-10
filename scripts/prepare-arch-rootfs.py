@@ -29,6 +29,13 @@ ROOTDIR = PREPARATION / 'rootdir'
 NCM_SERVICE = REPO / 'rootfs/etc/systemd/system/r8q-usb-gadget.service'
 NCM_SCRIPT = REPO / 'rootfs/usr/local/sbin/r8q-usb-gadget-up.sh'
 GETTY_OVERLAY = REPO / 'rootfs/etc/systemd/system/getty@tty1.service.d/autologin.conf'
+USB_ROUTE_SERVICE = REPO / 'rootfs/etc/systemd/system/r8q-usb-route.service'
+USB_ROUTE_WRAPPER = REPO / 'rootfs/usr/local/sbin/r8q-usb-route-up.sh'
+USB_ROUTE_HELPER = REPO / 'rootfs/usr/local/sbin/r8q-usb-route-ensure.sh'
+USB_ROUTE_PROTOCOL = REPO / 'rootfs/usr/local/lib/r8q-usb-route/protocol-binding.env'
+USB_ROUTE_MODPROBE = REPO / 'rootfs/etc/modprobe.d/r8q-usb-route.conf'
+USB_ROUTE_ENV_EXAMPLE = REPO / 'rootfs/etc/r8q-usb-route.env.example'
+USB_ROUTE_PACKAGES = REPO / 'rootfs/usr/share/r8q/r8q-usb-route.packages'
 
 MODULES_REL = 'usr/lib/modules'
 DISABLED_MODULES_REL = 'usr/lib/r8q-disabled-modules'
@@ -346,6 +353,8 @@ def enable_units() -> list[str]:
     links = {
         'etc/systemd/system/multi-user.target.wants/r8q-usb-gadget.service':
             '/etc/systemd/system/r8q-usb-gadget.service',
+        'etc/systemd/system/multi-user.target.wants/r8q-usb-route.service':
+            '/etc/systemd/system/r8q-usb-route.service',
         'etc/systemd/system/multi-user.target.wants/systemd-networkd.service':
             '/usr/lib/systemd/system/systemd-networkd.service',
         'etc/systemd/system/sockets.target.wants/systemd-networkd.socket':
@@ -383,6 +392,14 @@ def configure_rootfs(archive_sha256: str, archive_members: int) -> dict[str, obj
     )
     safe_copy(NCM_SERVICE, 'etc/systemd/system/r8q-usb-gadget.service', 0o644)
     safe_copy(NCM_SCRIPT, 'usr/local/sbin/r8q-usb-gadget-up.sh', 0o755)
+    safe_copy(USB_ROUTE_SERVICE, 'etc/systemd/system/r8q-usb-route.service', 0o644)
+    safe_copy(USB_ROUTE_WRAPPER, 'usr/local/sbin/r8q-usb-route-up.sh', 0o755)
+    safe_copy(USB_ROUTE_HELPER, 'usr/local/sbin/r8q-usb-route-ensure.sh', 0o755)
+    safe_copy(USB_ROUTE_PROTOCOL,
+              'usr/local/lib/r8q-usb-route/protocol-binding.env', 0o644)
+    safe_copy(USB_ROUTE_MODPROBE, 'etc/modprobe.d/r8q-usb-route.conf', 0o644)
+    safe_copy(USB_ROUTE_ENV_EXAMPLE, 'etc/r8q-usb-route.env.example', 0o644)
+    safe_copy(USB_ROUTE_PACKAGES, 'usr/share/r8q/r8q-usb-route.packages', 0o644)
     safe_copy(GETTY_OVERLAY,
               'etc/systemd/system/getty@tty1.service.d/autologin.conf', 0o644)
 
@@ -400,16 +417,22 @@ def configure_rootfs(archive_sha256: str, archive_members: int) -> dict[str, obj
         safe_symlink(f'etc/systemd/system/{unit}', '/dev/null')
     enabled = enable_units()
 
-    # Reassert ownership/modes on every file this preparation wrote.  No
-    # repository overlay file other than the three explicitly copied above is
-    # included, and /home/alarm and the rest of the extracted tree are left as
-    # provided by the trusted archive.
+    # Reassert ownership/modes on every prepared file. Only the repository
+    # overlay files listed above are included; /home/alarm and the rest of
+    # the extracted tree remain as provided by the trusted archive.
     for relative, mode in (
         ('etc/fstab', 0o644),
         ('etc/hostname', 0o644),
         ('etc/systemd/network/20-usb0.network', 0o644),
         ('etc/systemd/system/r8q-usb-gadget.service', 0o644),
         ('usr/local/sbin/r8q-usb-gadget-up.sh', 0o755),
+        ('etc/systemd/system/r8q-usb-route.service', 0o644),
+        ('usr/local/sbin/r8q-usb-route-up.sh', 0o755),
+        ('usr/local/sbin/r8q-usb-route-ensure.sh', 0o755),
+        ('usr/local/lib/r8q-usb-route/protocol-binding.env', 0o644),
+        ('etc/modprobe.d/r8q-usb-route.conf', 0o644),
+        ('etc/r8q-usb-route.env.example', 0o644),
+        ('usr/share/r8q/r8q-usb-route.packages', 0o644),
         ('etc/systemd/system/getty@tty1.service.d/autologin.conf', 0o644),
         ('etc/ssh/sshd_config', 0o644),
         ('etc/shadow', 0o600),
@@ -434,11 +457,19 @@ def configure_rootfs(archive_sha256: str, archive_members: int) -> dict[str, obj
             'etc/systemd/network/20-usb0.network',
             'etc/systemd/system/r8q-usb-gadget.service',
             'usr/local/sbin/r8q-usb-gadget-up.sh',
+            'etc/systemd/system/r8q-usb-route.service',
+            'usr/local/sbin/r8q-usb-route-up.sh',
+            'usr/local/sbin/r8q-usb-route-ensure.sh',
+            'usr/local/lib/r8q-usb-route/protocol-binding.env',
+            'etc/modprobe.d/r8q-usb-route.conf',
+            'etc/r8q-usb-route.env.example',
+            'usr/share/r8q/r8q-usb-route.packages',
             'etc/systemd/system/getty@tty1.service.d/autologin.conf',
             'etc/ssh/sshd_config',
             'etc/shadow',
         ],
         'enabled_units': enabled,
+        'required_phone_packages': ['i2c-tools'],
         'masked_sleep_units': masks,
         'root_password': password_action,
         'phone_access': False,

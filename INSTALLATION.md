@@ -335,11 +335,12 @@ at minimum `msm.ko` and its dependencies under `/lib/modules/$KV/`.
 **a) Userspace + generic firmware** (on the phone, over SSH):
 
 ```bash
-pacman -S mesa vulkan-freedreno linux-firmware-qcom sway foot seatd
+pacman -S i2c-tools mesa vulkan-freedreno linux-firmware-qcom sway foot seatd
 systemctl enable --now seatd
 ```
 
-That provides `/lib/firmware/qcom/a650_sqe.fw` and `a650_gmu.bin`.
+That installs the phone-side `i2ctransfer` tool used by the guarded USB route
+service and provides `/lib/firmware/qcom/a650_sqe.fw` and `a650_gmu.bin`.
 
 **b) The zap shader — from YOUR device's stock firmware.** Samsung's TrustZone
 only authenticates a **Samsung-signed** zap; the generic
