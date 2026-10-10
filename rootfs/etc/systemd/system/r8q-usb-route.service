@@ -1,0 +1,17 @@
+[Unit]
+Description=r8q CONTROL1 USB route recovery
+Wants=r8q-usb-gadget.service
+After=r8q-usb-gadget.service
+DefaultDependencies=yes
+ConditionPathExists=/etc/r8q-usb-route.env
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/r8q-usb-route-up.sh
+RemainAfterExit=yes
+TimeoutStartSec=45s
+Restart=no
+SyslogIdentifier=r8q-usb-route
+
+[Install]
+WantedBy=multi-user.target
