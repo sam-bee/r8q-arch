@@ -43,8 +43,8 @@ hl.config({
     border_size = 1,
   },
   misc = {
-    -- Keep the compositor's anime/default wallpaper disabled while the
-    -- Omarchy background plugin is intentionally excluded from this gate.
+    -- Omarchy renders the selected image; use Tokyo Night's solid color
+    -- while the wallpaper is loading, with no compositor default image.
     disable_hyprland_logo = true,
     disable_splash_rendering = true,
     force_default_wallpaper = 0,
@@ -59,6 +59,10 @@ hl.config({
     enabled = false,
   },
 })
+
+-- Generated from the pinned Tokyo Night palette and Omarchy's border template.
+-- Install this theme file before deploying or verifying the phone profile.
+dofile((os.getenv("HOME") or "/home/alarm") .. "/.local/state/omarchy/current/theme/hyprland.lua")
 
 hl.on("hyprland.start", function()
   -- Update this session's private bus for portal activation. This system

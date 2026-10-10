@@ -63,7 +63,9 @@ python3 r8q-arch/scripts/prepare-omarchy-runtime.py \
 The expected hash and source commit are fixed in the script and in the pinned
 source manifest. The preparer hashes the archive before reading it, copies only
 `shell/`, `default/omarchy/`, the upstream `config/omarchy/shell.json`,
-`bin/omarchy-launch-shell`, `bin/omarchy-shell`, `version`, and `LICENSE`,
+`bin/omarchy-launch-shell`, `bin/omarchy-shell`, `bin/omarchy-theme-bg-set`,
+Tokyo Night's `colors.toml`, its `0-winding-road.jpg` and `1-quattro.jpg`
+wallpapers, the Foot and Hyprland theme templates, `version`, and `LICENSE`,
 then copies the tracked phone overlay from
 `rootfs/usr/share/r8q/omarchy/`. The upstream shell config is retained as
 `config/omarchy/upstream-shell.json`; the reviewed phone config becomes the
@@ -204,8 +206,9 @@ Apple-specific hardware gate is folded into this desktop payload.
 ## Current limited shell
 
 The actual current Omarchy shell is Quickshell, not a Waybar-labelled
-substitute. The frozen configuration enables only workspaces, a clock and the
-small `r8q.launcher` plugin. The plugin's touch-sized controls launch `foot`
+substitute. The phone configuration enables workspaces, a clock, the image
+background and the small `r8q.launcher` plugin. The plugin's touch-sized
+controls launch `foot`
 and call the verified `sm.puri.OSK0.SetVisible` session method. Notifications,
 audio, Bluetooth, network, power, battery, idle, lock, OSD and polkit plugins
 are explicitly disabled until their phone package and hardware gates pass.
@@ -216,9 +219,10 @@ verified in the current deployment.
 
 ## Wallpaper gate
 
-Disabling `omarchy.background` removes Quickshell's image panel; it does not
-remove Hyprland's own default anime background. The phone Lua therefore carries
-the small compositor-native fix: `misc.disable_hyprland_logo = true`,
+The first desktop gate disabled `omarchy.background` and used a solid Tokyo
+Night background. The current phone configuration enables the upstream
+background renderer. Hyprland's own default image remains disabled with
+`misc.disable_hyprland_logo = true`,
 `misc.disable_splash_rendering = true`, `misc.force_default_wallpaper = 0`,
 and `misc.background_color = 0xff1a1b26`. Hyprland documents that
 `background_color` requires `disable_hyprland_logo`, and that
@@ -226,7 +230,50 @@ and `misc.background_color = 0xff1a1b26`. Hyprland documents that
 ([official variables reference](https://wiki.hypr.land/Configuring/Basics/Variables/));
 the same `force_default_wallpaper` form appears in the pinned Omarchy Lua
 source at `default/sddm/hyprland.lua`. `Hyprland --verify-config` passed on the
-phone, and the post-reboot screenshot confirmed the solid Tokyo Night color.
+phone during the first gate, and the post-reboot screenshot confirmed the
+solid Tokyo Night color.
+
+The current preparer preserves the original bytes of two wallpapers from the
+pinned v4.0.4 archive under `/usr/share/omarchy/themes/tokyo-night/backgrounds/`.
+The usual `0-winding-road.jpg` is the initial selection; `1-quattro.jpg` is the
+rally-car alternative. The upstream renderer uses `Image.PreserveAspectCrop`
+with the Qt default center alignment: it scales uniformly to fill the display
+and crops the sides of a landscape image on the portrait panel. It does not
+distort the image's proportions. No edited or regenerated bitmap is needed
+([Qt Image reference](https://doc.qt.io/qt-6/qml-qtquick-image.html#fillMode-prop)).
+
+Before deploying the updated Lua, copy the reviewed theme files from
+`/usr/share/r8q/omarchy/theme/tokyo-night/` to
+`/home/alarm/.local/state/omarchy/current/theme/`, owned by `alarm`.
+The Lua loads `hyprland.lua` from that directory. The Foot and Hyprland theme
+files were generated using the pinned upstream `omarchy-theme-color` and
+`omarchy-theme-set-templates` helpers with only their two staged templates in
+an isolated offline HOME. They preserve upstream output exactly; the shell
+palette and generated shell theme remain the existing Tokyo Night files.
+Copy `phone-foot.ini` to `/home/alarm/.config/foot/foot.ini` after backing up
+any prior config; it includes the current theme's Foot colors. Record
+`tokyo-night` in `~/.local/state/omarchy/current/theme.name` and create
+`~/.local/state/omarchy/current/background` as an `alarm`-owned symlink to the
+selected wallpaper. Install the theme state before the Lua and shell configs.
+
+To switch either supplied image from the phone's normal desktop terminal, use
+`omarchy-theme-bg-set /usr/share/omarchy/themes/tokyo-night/backgrounds/1-quattro.jpg`
+(substitute `0-winding-road.jpg` to restore the initial choice). The Lua already
+puts `/usr/share/omarchy/bin` on the session PATH. The graphical image picker
+remains disabled, and its selector helpers and the full theme installer are
+excluded from this phone payload.
+
+On 2026-10-10, the primary validated both generated configs on the phone,
+applied the theme to the running desktop, and visually checked its original
+1080x2400 screenshot. The centered wallpaper survived plugin re-instantiation
+without an image IPC call, and a temporary Foot window rendered the Tokyo
+Night foreground, background and ANSI colors. The test restored keyboard
+visibility and left no temporary app clients. Hyprland and Quickshell retained
+their PIDs, with zero desktop service restarts. The new UI checksum baseline is
+`/root/r8q-desktop-tokyo-night.sha256`; the previous 140 baseline remains a
+historical receipt. USB and wireless SSH and the protected payload hashes
+passed. This change was checked through live config/plugin reloads, not a new
+phone reboot.
 
 The source/runtime pins and archive hashes are recorded above in this tracked
 document; the tracked phone files are under `rootfs/usr/share/r8q/omarchy/`.

@@ -25,7 +25,6 @@
   },
   "plugins": [],
   "disabledPlugins": [
-    "omarchy.background",
     "omarchy.emojis",
     "omarchy.image-picker",
     "omarchy.clipboard",

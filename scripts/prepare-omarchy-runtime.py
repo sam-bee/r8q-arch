@@ -3,9 +3,10 @@
 
 This is an offline file preparer.  It accepts a caller-provided Omarchy source
 archive, verifies the pinned v4.0.4 SHA-256, copies only the shell/runtime files
-needed by the phone overlay, and emits a hashed manifest.  It never downloads,
-executes archive content, invokes a package manager, touches a live root, or
-changes the existing rootfs preparation flow.
+needed by the phone overlay plus the pinned Tokyo Night wallpaper inputs, and
+emits a hashed manifest.  It never downloads, executes archive content, invokes
+a package manager, touches a live root, or changes the existing rootfs
+preparation flow.
 """
 
 from __future__ import annotations
@@ -35,6 +36,16 @@ SOURCE_FILES = (
     'config/omarchy/shell.json',
     'bin/omarchy-launch-shell',
     'bin/omarchy-shell',
+    # The pinned Tokyo Night selection is deliberately limited to the color
+    # data, two authentic wallpaper choices, and the templates/helpers needed
+    # to apply them. Other themes, app templates and picker helpers stay out;
+    # the bundled image-picker code remains disabled in the phone config.
+    'themes/tokyo-night/colors.toml',
+    'themes/tokyo-night/backgrounds/0-winding-road.jpg',
+    'themes/tokyo-night/backgrounds/1-quattro.jpg',
+    'default/themed/foot.ini.tpl',
+    'default/themed/hyprland.lua.tpl',
+    'bin/omarchy-theme-bg-set',
     'version',
     'LICENSE',
 )
@@ -223,7 +234,10 @@ def copy_source_files(archive: Path, top: str, selected: dict[str, tarfile.TarIn
                 if relative == 'config/omarchy/shell.json' else relative
             )
             target = output / 'rootfs' / 'usr' / 'share' / 'omarchy' / target_relative
-            mode = 0o755 if relative in ('bin/omarchy-launch-shell', 'bin/omarchy-shell') else 0o644
+            # All explicitly selected bin helpers are executable, regardless
+            # of the mode recorded in the source archive.  Non-bin inputs are
+            # staged as data files.
+            mode = 0o755 if relative.startswith('bin/') else 0o644
             files.append(write_regular(data, target, mode))
     return files
 
