@@ -1,0 +1,24 @@
+# Package gate for the selective SM-G7810 Quattro shell. This is a review
+# manifest only; the runtime preparer and rootfs preparation never install it.
+# Query the synchronized official Arch Linux ARM repositories and retain the
+# transaction receipt before adding any name.
+quickshell
+xdg-desktop-portal
+xdg-desktop-portal-hyprland
+xdg-desktop-portal-gtk
+wl-clipboard
+wtype
+inotify-tools
+squeekboard
+python-gobject
+gtk3
+jq
+perl
+gum
+libbsd
+libmd
+ttf-jetbrains-mono-nerd
+
+# Quickshell dependency closure (let the signed resolver select versions):
+# qt6-base qt6-declarative qt6-svg qt6-wayland libpipewire polkit pam
+# cpptrace jemalloc hicolor-icon-theme libdrm libxcb mesa wayland

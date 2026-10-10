@@ -1,26 +1,23 @@
 [Unit]
-Description=r8q battery: MAX77705 fuel gauge + charger (SE0) module load
-# The geni i2c bus (SE0) carrying the MAX77705 (fuel gauge @0x36, PMIC @0x66,
-# charger @0x69) is brought up by r8q-touch.service; the i2c devices are then
-# auto-created from the DT. Load the drivers afterwards: fuel gauge (read-only
-# telemetry), then the MFD (provides the IRQ domain), then the charger. Cold-load
-# once, modules live outside /lib/modules (udev coldplug stays disabled).
-After=r8q-touch.service
-Requires=r8q-touch.service
-ConditionPathExists=!/sys/class/power_supply/max77705-charger
+Description=r8q battery telemetry and MAX77705 charger (route-gated)
+# The gadget may be active before its UDC has reached configured state. Keep
+# both dependencies explicit and let r8q-battery-up.sh wait for that state.
+# r8q-usb-route.service remains the owner of the tested USB route and must
+# finish before any MAX77705 or MAX17042 driver is loaded.
+Requires=r8q-usb-gadget.service r8q-usb-route.service r8q-touch.service
+After=r8q-usb-gadget.service r8q-usb-route.service r8q-touch.service
+Before=graphical.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/insmod /root/ts/max17042_battery.ko
-ExecStart=/usr/bin/insmod /root/ts/max77705.ko
-ExecStart=/usr/bin/insmod /root/ts/max77705_charger.ko
-# Raise the charge input above the 500 mA USB-SDP default. Mainline has no
-# MAX77705 MUIC driver, so the port type is never detected and the charger
-# stays at SDP -- at which point a running GNOME session draws MORE than the
-# charger is allowed to pull from VBUS and the pack discharges while plugged
-# in. 700 mA (rounds to 725) makes the net battery current positive.
-ExecStartPost=/bin/sh -c 'C=/sys/class/power_supply/max77705-charger; for i in $(seq 20); do [ -e $C/input_current_limit ] && break; sleep 1; done; echo 700000 > $C/input_current_limit; echo 1000000 > $C/constant_charge_current'
+ExecStartPre=/usr/bin/systemctl is-active --quiet r8q-usb-gadget.service
+ExecStartPre=/usr/bin/systemctl is-active --quiet r8q-usb-route.service
+ExecStart=/usr/local/sbin/r8q-battery-up.sh
 RemainAfterExit=yes
+# The USB wait and six bounded probe waits can total 165 seconds. Leave
+# additional time for module insertion and receipt capture before timing out.
+TimeoutStartSec=240s
+Restart=no
 
 [Install]
 WantedBy=multi-user.target

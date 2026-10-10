@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "bar": {
+    "position": "top",
+    "transparent": false,
+    "centerAnchor": "",
+    "layout": {
+      "left": [
+        {
+          "id": "r8q.launcher"
+        },
+        {
+          "id": "omarchy.workspaces"
+        }
+      ],
+      "center": [],
+      "right": [
+        {
+          "id": "omarchy.clock",
+          "format": "HH:mm",
+          "formatAlt": "d MMMM yyyy"
+        }
+      ]
+    }
+  },
+  "plugins": [],
+  "disabledPlugins": [
+    "omarchy.background",
+    "omarchy.emojis",
+    "omarchy.image-picker",
+    "omarchy.clipboard",
+    "omarchy.reminders",
+    "omarchy.menu",
+    "omarchy.notifications",
+    "omarchy.audio",
+    "omarchy.bluetooth",
+    "omarchy.monitor",
+    "omarchy.network",
+    "omarchy.power",
+    "omarchy.tailscale",
+    "omarchy.agents",
+    "omarchy.weather",
+    "omarchy.media",
+    "omarchy.battery",
+    "omarchy.idle",
+    "omarchy.nightlight",
+    "omarchy.lock",
+    "omarchy.osd",
+    "omarchy.polkit"
+  ]
+}

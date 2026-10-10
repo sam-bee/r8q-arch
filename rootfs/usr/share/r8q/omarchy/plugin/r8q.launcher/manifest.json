@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "r8q.launcher",
+  "name": "R8Q launch controls",
+  "version": "0.1.0",
+  "author": "r8q-arch",
+  "description": "Touch-sized terminal and keyboard controls for SM-G7810",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "R8Q launch controls",
+    "description": "Opens foot or toggles the reviewed Squeekboard helper",
+    "category": "Phone",
+    "defaultSection": "left",
+    "allowMultiple": false
+  }
+}

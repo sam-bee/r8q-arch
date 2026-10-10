@@ -235,17 +235,34 @@ PMIC/MUIC at `0x66`, and the charger at `0x69`.
   mainline's MFD rejects (it only whitelists PASS3), so `patches/0005` relaxes that
   check — the register layout is identical on PASS2.
 
-`r8q-battery.service` loads all three modules after `r8q-touch.service` brings the
-bus up. The fuel-gauge node is deliberately left IRQ-less so read-only telemetry
-keeps working even if the charger/MFD ever fail to probe.
+`r8q-battery.service` loads all three modules after the USB gadget, recovery
+route, and touchscreen startup. On the validated SM-G7810 RTC2 image, its
+helper checks the machine, mounted-root UUID, kernel, private module hashes,
+configured USB state, and driver ownership before loading fuel gauge → MFD →
+charger. The modules remain outside the normal module search path. This gate
+requires the USB cable to remain attached. The fuel-gauge node is deliberately
+left IRQ-less; telemetry uses polling.
 
-One caveat worth knowing: mainline has no driver for the MAX77705's MUIC, so the
+Keep this service disabled on the current SM-G7810 RTC2 image. The
+2026-10-10 automatic-startup trials repeatedly produced unhandled MAX77705
+IRQ215 storms followed by SE0 I2C timeouts. Successful module loading and
+polling telemetry did not establish reliable charger events. The independent
+desktop service can start without these drivers; see the desktop document for
+the recorded evidence and current deployment policy.
+
+Mainline has no driver for the MAX77705's MUIC, so the
 port type is never detected and the charger stays at the USB-SDP default of
 **500 mA**. A running GNOME session draws more than that, so the pack slowly
 *discharges* while plugged in even though the charger reports `Charging`. The
-service raises `input_current_limit` to 700 mA on start, which makes the net
-battery current positive again. Raise it further at your own risk — it is the
-host port, not the phone, that has to supply it.
+current route-gated service retains **500 mA** for both input and charge-current
+limits. It makes no higher-current assumption about the USB source. The
+2026-10-10 console measurements showed positive net battery current, while the
+bright GTK touch-test app drew more than the connection supplied. Judge net
+charging from gauge current and charge over time, rather than charger status.
+
+The selective normal-user Hyprland/Omarchy Quattro desktop, package manifest,
+offline runtime preparer and recovery procedure are documented in
+[docs/r8q-desktop.md](docs/r8q-desktop.md).
 
 ### Wi-Fi
 

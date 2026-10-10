@@ -1,0 +1,27 @@
+#!/bin/sh
+# Start the phone keyboard inside the compositor's D-Bus/Wayland session.
+set -eu
+test "$(id -un)" = alarm
+: "${DBUS_SESSION_BUS_ADDRESS:?desktop session bus is required}"
+: "${WAYLAND_DISPLAY:?compositor Wayland socket is required}"
+export GDK_BACKEND=wayland GTK_IM_MODULE=wayland SQUEEKBOARD_DEBUG=force_show
+gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true
+squeekboard &
+osk_pid=$!
+trap 'kill -TERM "$osk_pid" 2>/dev/null || :' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+# Explicit visibility also supports applications without text-input requests.
+visible=false
+for attempt in $(seq 1 40); do
+    kill -0 "$osk_pid" 2>/dev/null || { wait "$osk_pid"; exit 1; }
+    if gdbus call --session --dest sm.puri.OSK0 --object-path /sm/puri/OSK0 \
+        --method sm.puri.OSK0.SetVisible true >/dev/null 2>&1; then
+        visible=true
+        break
+    fi
+    sleep .25
+done
+test "$visible" = true || { echo 'Keyboard visibility request failed' >&2; exit 1; }
+wait "$osk_pid"

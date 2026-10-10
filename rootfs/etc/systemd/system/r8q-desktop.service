@@ -1,0 +1,35 @@
+[Unit]
+Description=r8q normal-user Hyprland desktop
+Requires=r8q-usb-route.service r8q-gpu.service r8q-touch.service seatd.service
+# Ordering alone does not start battery drivers. Keep them disabled for UI
+# boots until the MAX77705 IRQ gate passes; deliberate battery trials must
+# finish before a desktop that has also been explicitly enabled.
+After=r8q-usb-route.service r8q-gpu.service r8q-touch.service seatd.service r8q-battery.service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+ConditionPathExists=/home/alarm/.config/hypr/hyprland.lua
+ConditionPathExists=/usr/share/omarchy/bin/omarchy-launch-shell
+ConditionPathExists=/home/alarm/.config/omarchy/shell.json
+ConditionPathExists=/home/alarm/.config/omarchy/plugins/r8q.launcher/manifest.json
+ConditionPathExists=/home/alarm/.config/omarchy/plugins/r8q.launcher/BarWidget.qml
+
+[Service]
+Type=exec
+User=alarm
+SupplementaryGroups=video render input seat
+Environment=XDG_RUNTIME_DIR=/run/r8q-desktop
+Environment=R8Q_DESKTOP_CONFIG=/home/alarm/.config/hypr/hyprland.lua
+RuntimeDirectory=r8q-desktop
+RuntimeDirectoryMode=0700
+TTYPath=/dev/tty7
+StandardInput=tty
+TTYReset=yes
+TTYVHangup=yes
+ExecStart=/usr/local/bin/r8q-desktop-session
+KillMode=control-group
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

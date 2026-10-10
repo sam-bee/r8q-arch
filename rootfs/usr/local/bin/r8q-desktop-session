@@ -1,0 +1,48 @@
+#!/bin/sh
+# Run the phone's selected Hyprland desktop as alarm on its private seatd VT.
+set -eu
+
+test "$(id -un)" = alarm || { echo 'r8q desktop must run as alarm' >&2; exit 1; }
+: "${XDG_RUNTIME_DIR:?systemd must provide a private runtime directory}"
+test -d "$XDG_RUNTIME_DIR"
+test "$(stat -c '%U:%a' "$XDG_RUNTIME_DIR")" = alarm:700
+config=${R8Q_DESKTOP_CONFIG:-/home/alarm/.config/hypr/hyprland.lua}
+test -r "$config" || { echo "Missing desktop configuration: $config" >&2; exit 1; }
+
+# The display controller and render-only GPU have separate DRM nodes.
+export AQ_DRM_DEVICES=/dev/dri/by-path/platform-9c000000.framebuffer-card
+export LIBSEAT_BACKEND=seatd
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=Hyprland
+export XDG_SESSION_DESKTOP=Hyprland
+export GDK_BACKEND=wayland
+export GTK_IM_MODULE=wayland
+export QT_QPA_PLATFORM=wayland
+export LC_ALL=C.UTF-8
+unset DISPLAY WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE DBUS_SESSION_BUS_ADDRESS
+
+test -c "$AQ_DRM_DEVICES"
+display_node=$(basename "$(readlink -f "$AQ_DRM_DEVICES")")
+test "$(readlink -f "/sys/class/drm/$display_node/device/driver")" = /sys/bus/platform/drivers/simple-framebuffer
+test "$(cat "/sys/class/drm/$display_node-DSI-1/status")" = connected
+test -c /dev/dri/by-path/platform-3d00000.gpu-render
+test -S /run/seatd.sock
+for program in dbus-run-session start-hyprland Hyprland squeekboard ldd pgrep \
+    gdbus gsettings foot quickshell omarchy-launch-shell inotifywait \
+    dbus-update-activation-environment; do
+    command -v "$program" >/dev/null
+done
+if pgrep -x Hyprland >/dev/null || pgrep -x start-hyprland >/dev/null; then
+    echo 'A compositor or its watchdog is already running' >&2
+    exit 1
+fi
+ldd /usr/bin/squeekboard > "$XDG_RUNTIME_DIR/squeekboard-ldd.txt"
+if grep -q 'not found' "$XDG_RUNTIME_DIR/squeekboard-ldd.txt"; then
+    echo 'Squeekboard has unresolved runtime libraries' >&2
+    exit 1
+fi
+Hyprland --verify-config --config "$config"
+
+# One bus is inherited by the compositor and every configured startup client.
+# systemd stops the entire service cgroup when the desktop is stopped.
+exec dbus-run-session -- start-hyprland -- --config "$config"
