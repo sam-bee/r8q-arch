@@ -388,8 +388,25 @@ No kernel config changes are needed — ATH11K(+PCI), MHI, QRTR, `PCIE_QCOM`,
 defconfig. The DT nodes are in [`dts/`](dts/) and the firmware comes from
 `linux-firmware`.
 
-**a) Modules and firmware on the phone.** `make modules_install` must have put
-these under `/lib/modules/$KV/`, and one of them is easy to miss:
+On the minimal RTC2 image, install only the following Wi-Fi policy files from
+the overlay, before adding modules or starting NetworkManager. Run these on the
+phone after transferring those files; the existing verified USB route unit and
+its pinned GPI/GENI modules must already be in place.
+
+```bash
+install -Dm644 rootfs/etc/modprobe.d/r8q-wifi-blacklist.conf /etc/modprobe.d/r8q-wifi-blacklist.conf
+install -Dm644 rootfs/etc/systemd/system/r8q-wifi.service /etc/systemd/system/r8q-wifi.service
+install -Dm755 rootfs/usr/local/sbin/r8q-wifi-up.sh /usr/local/sbin/r8q-wifi-up.sh
+install -Dm644 rootfs/etc/systemd/system/NetworkManager.service.d/10-r8q-usb-route.conf \
+  /etc/systemd/system/NetworkManager.service.d/10-r8q-usb-route.conf
+install -Dm644 rootfs/etc/NetworkManager/conf.d/10-r8q.conf /etc/NetworkManager/conf.d/10-r8q.conf
+systemctl daemon-reload
+```
+
+**a) Modules and firmware on the phone.** Install the Wi-Fi dependency closure
+under `/lib/modules/$(uname -r)/`, with matching kernel config, exports and
+vermagic, and run `depmod -a`. Do not replace the pinned GPI/GENI modules or add
+the battery driver for this step. One dependency is easy to miss:
 
 ```bash
 ssh root@172.16.42.1 'ls /lib/firmware/ath11k/QCA6390/hw2.0/'   # amss.bin board-2.bin m3.bin
@@ -401,15 +418,27 @@ nothing binds to the MHI `IPCR` channel, QMI never starts, and ath11k stops
 dead at `Wait for device to enter SBL or Mission mode` with no further output —
 which looks like a firmware failure but is not one.
 
+For the minimal `7.1.2-r8q-rtc2` image, complete a full package upgrade before
+adding NetworkManager, `iw`, or `wireless-regdb`. This kernel lacks Landlock, so
+the verified phone bootstrap used one temporary pacman configuration under
+`/run` while retaining package signature checks; `/etc/pacman.conf` stayed
+unchanged. Keep this workaround phone-specific and do not install a blanket
+legacy overlay.
+
 **b) Overlay + service.** The [`rootfs/`](rootfs/) overlay ships:
 
 - `etc/modprobe.d/r8q-wifi-blacklist.conf` — keeps udev from coldplugging the
-  Wi-Fi stack at ~9 s, which races the touch/battery geni bring-up (SE0 i2c
-  timeouts + MAX77705 IRQ storms).
-- `etc/systemd/system/r8q-wifi.service` — loads it deliberately instead, in
-  order: `phy-qcom-qmp-pcie` (the PCIe **phy is a module**; without it
-  `1c00000.pcie` silently defers) → `pwrseq-qcom-wcn` → `pci-pwrctrl-pwrseq` →
-  wait for the endpoint → `qrtr-mhi` → `ath11k_pci`.
+  Wi-Fi stack at ~9 s. The USB route service already owns the GPI/GENI bring-up;
+  this Wi-Fi unit therefore has no battery or touch dependency.
+- `etc/systemd/system/r8q-wifi.service` — requires the completed
+  `r8q-usb-route.service` and checks it is active before loading, in order:
+  `phy-qcom-qmp-pcie` (the PCIe **phy is a module**; without it `1c00000.pcie`
+  silently defers) → `pwrseq-qcom-wcn` → `pci-pwrctrl-pwrseq` → bounded wait for
+  the discovered endpoint → `qrtr-mhi` → `ath11k_pci` → bounded wait for an
+  endpoint-associated PHY. It does not assume a fixed BDF or PHY name.
+- `etc/systemd/system/NetworkManager.service.d/10-r8q-usb-route.conf` — holds
+  NetworkManager behind the same route guard, so its `nl80211` probe cannot
+  autoload `cfg80211`/`rfkill` first. The blacklist includes those modules.
 - `etc/NetworkManager/conf.d/10-r8q.conf` — see (c).
 
 ```bash
@@ -422,20 +451,33 @@ starting it, and put the config in place first — the config is what keeps NM o
 `usb0`, and `usb0` is the SSH connection you are typing over:
 
 ```bash
-pacman -S networkmanager wireless-regdb
+pacman -Syu --needed networkmanager iw wireless-regdb
 install -Dm644 rootfs/etc/NetworkManager/conf.d/10-r8q.conf \
-               /etc/NetworkManager/conf.d/10-r8q.conf   # usb0 unmanaged, dns=none
+               /etc/NetworkManager/conf.d/10-r8q.conf   # usb0 unmanaged, resolved DNS
 systemctl enable --now NetworkManager
 systemctl disable NetworkManager-wait-online.service    # else it stalls boot
 nmcli device status      # want: wlp1s0 managed, usb0 "unmanaged"
 ```
 
-Two gotchas:
+The drop-in sets `dns=systemd-resolved`, leaves `usb0` with networkd, and sends
+Wi-Fi DHCP DNS to resolved. Wi-Fi connections use route metric 50 versus the
+USB fallback's 1000. It deliberately disables NetworkManager's connectivity
+probe: a failed external probe previously added 20000 to the Wi-Fi metric and
+kept USB preferred despite successful association. `wifi.cloned-mac-address=stable`
+gives the QCA6390 a stable per-profile address even though this phone reports
+`board_id 0xff` and no calibration address. `wifi.powersave=2` keeps incoming
+SSH responsive during hardware bring-up.
+
+Package gotchas:
 
 - If `nmcli` dies with `libnm.so.0: version 'libnm_1_xx_0' not found`, you did a
   partial upgrade (`pacman -Sy networkmanager` against an older `libnm`). Fix with
-  `pacman -S libnm`. The daemon runs regardless, but every client — `nmcli`,
+  a complete `pacman -Syu`. The daemon runs regardless, but every client — `nmcli`,
   gnome-control-center, the GNOME shell menu — is broken until the versions match.
+- On the current RTC2 image, the full upgrade was completed with a temporary
+  `/run` pacman configuration because the phone kernel lacks Landlock. Keep the
+  default `/etc/pacman.conf` unchanged; do not turn the temporary workaround
+  into a persistent global overlay.
 - Do package installs over a transient link with
   `systemd-run --unit=install --collect pacman -S ...` so an SSH drop cannot
   abort the transaction half-way.
@@ -447,8 +489,15 @@ nmcli device wifi list
 nmcli device wifi connect 'YOUR-SSID' password 'YOUR-PASSPHRASE'
 ```
 
-NM stores the connection in `/etc/NetworkManager/system-connections/`, so it
-reconnects on its own after a reboot.
+NM stores the connection in `/etc/NetworkManager/system-connections/` for
+automatic reconnection. The validated RTC2 run associated and
+received `192.168.178.98`; wireless DNS, HTTPS, and ping passed after the USB
+default gateway was temporarily removed, while `usb0` remained unmanaged.
+The first reboot with Wi-Fi enabled did not restore either USB or wireless
+access. The NetworkManager gate and expanded blacklist were prepared after
+that failure and remain undeployed; offline validation cannot identify the
+runtime cause. Recover the boot logs and repeat reboot/reconnection checks
+before treating the path as fully proven.
 
 **Debugging note.** If MHI ever stalls again, build `mhi.ko` with
 `CONFIG_MHI_BUS_DEBUG=y` and read `/sys/kernel/debug/mhi/*/regdump`. It prints

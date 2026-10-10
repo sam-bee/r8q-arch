@@ -273,22 +273,52 @@ Two things will cost you a lot of time if you don't know them:
   `/sys/kernel/debug/mhi/*/regdump`: `BHI_EXECENV: 0x2` means the device is in
   mission mode and the problem is above MHI, not in the firmware.
 
-`r8q-wifi.service` loads the stack deliberately, in order, after the geni bus is
-up: `phy-qcom-qmp-pcie` → `pwrseq-qcom-wcn` → `pci-pwrctrl-pwrseq` → wait for the
-endpoint → `qrtr-mhi` → `ath11k_pci`. `r8q-wifi-blacklist.conf` stops udev from
-coldplugging any of it at ~9 s, which otherwise races the touch/battery bring-up
-on the same geni controller and produces SE0 i2c timeouts and MAX77705 IRQ storms.
+`r8q-wifi.service` loads the stack deliberately, in order, only after the
+successful `r8q-usb-route.service`: `phy-qcom-qmp-pcie` → `pwrseq-qcom-wcn` →
+`pci-pwrctrl-pwrseq` → wait for the QCA6390 endpoint → `qrtr-mhi` → `ath11k_pci`
+→ wait for its associated PHY. The service has both a systemd dependency and an
+active-state precheck, so a skipped route guard cannot accidentally start Wi-Fi.
+The route service owns the GPI/GENI bring-up; Wi-Fi does not pull in
+`r8q-battery.service` or `r8q-touch.service`. `r8q-wifi-blacklist.conf` stops
+udev from coldplugging any of the Wi-Fi modules, while the service loads them
+deliberately. The NetworkManager service drop-in also waits for the USB route:
+probing the `nl80211` generic-netlink family can otherwise request `cfg80211`
+and its `rfkill` dependency before the route guard. These modules are now
+blacklisted along with the rest of the wireless stack. Install this policy
+before adding the modules; do not copy the legacy full overlay wholesale.
+
+The endpoint and PHY waits are dynamic and bounded. The helper accepts a PHY
+only when its sysfs device path belongs to the discovered QCA6390 PCI endpoint;
+it does not assume a fixed PCI BDF or `phy0`. ASPM is disabled only when the
+kernel exposes the corresponding controls, and an absent control is logged and
+left at its default.
 
 Association is **NetworkManager**, so you can join a network from GNOME's own
 Wi-Fi menu on the touchscreen instead of editing config over SSH. The one thing
 that must be right is `NetworkManager/conf.d/10-r8q.conf`: it marks **`usb0`
 unmanaged**, because that interface is the SSH lifeline and is configured
 statically by systemd-networkd — let NM take it over and it will reconfigure the
-interface out from under your session. `dns=none` for the same reason (the static
-`/etc/resolv.conf` is what the USB tether relies on).
+interface out from under your session. The drop-in uses `dns=systemd-resolved`,
+so Wi-Fi DHCP DNS is handed to resolved while the USB link remains networkd-
+managed. Wi-Fi profiles use route metric 50 and the USB fallback uses metric
+1000, so an associated Wi-Fi default route wins without disturbing the on-link
+SSH route. The NM connectivity probe is intentionally disabled: during bring-up
+a failed external probe added 20000 to the Wi-Fi metric even after association,
+making USB win for the wrong reason. The drop-in also requests the stable Wi-Fi
+cloned-MAC policy; the firmware still reports `board_id 0xff` and no
+calibration data, so ath11k has no reliable stored hardware address.
+Power saving is disabled during bring-up to keep incoming SSH and neighbor
+discovery responsive.
 
-Note that the MAC address is random on every boot: this unit reports
-`board_id 0xff` and no calibration data, so ath11k has no stored address to use.
+On the current `7.1.2-r8q-rtc2` image, QCA6390 association and DHCP succeeded
+(`192.168.178.98`), and wireless DNS, HTTPS, and ping were verified with the USB
+default gateway temporarily removed. `usb0` remained unmanaged throughout.
+That validates the independent wireless path; reboot/reconnect soak remains a
+separate check. The first reboot with Wi-Fi enabled did **not** restore USB or
+wireless access. The NetworkManager startup gate and expanded blacklist above
+were prepared afterward and have passed offline checks, but remain undeployed.
+An early-module race and an ath11k/MHI shutdown stall are hypotheses until the
+phone's boot logs can be recovered. Automatic reconnection is not yet proven.
 
 Two things worth knowing about the log noise Wi-Fi produces:
 
@@ -297,9 +327,10 @@ Two things worth knowing about the log noise Wi-Fi produces:
   Layer ... [12] Timeout` *correctable* errors whenever Wi-Fi goes active. They
   are harmless — the packet is retransmitted — but they flood the log. Measured
   over three scans: 6 with ASPM on, 0 with it off. `r8q-wifi.service` therefore
-  disables ASPM on that one link, and it has to do so **after** `phy0` appears:
+  disables ASPM on that one link after the endpoint's associated PHY appears:
   ath11k disables ASPM for the firmware download and then calls `aspm_restore`,
-  which puts it back.
+  which puts it back. If the kernel has no per-link ASPM controls, the helper
+  leaves them alone.
 - **They were reaching the panel because of the initramfs.** `/init` raises the
   console log level to 8 so early boot lands in the ESP logs, and nothing lowers
   it again — so `loglevel=3` on the cmdline is overridden for the whole session
